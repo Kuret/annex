@@ -1,0 +1,137 @@
+#!/bin/sh
+# Manage Annex app backends.
+#
+#   annex-service install         install the template unit
+#   annex-service sync            enable a service for every app with a backend,
+#                                 disable one for every app that lost it
+#   annex-service enable <app>    enable and start one
+#   annex-service disable <app>   stop and disable one
+#   annex-service restart <app>
+#   annex-service status [app]
+#   annex-service log <app>       follow the journal
+#
+# An app has a backend if apps/<id>/backend/run exists and is executable.
+# That convention is the whole configuration — see annex-app@.service.
+set -u
+
+ROOT="${ANNEX_ROOT:-/home/root/annex}"
+UNIT_SRC="$ROOT/systemd/annex-app@.service"
+UNIT_DST=/etc/systemd/system/annex-app@.service
+
+die() { echo "annex-service: $*" >&2; exit 1; }
+
+has_backend() {
+    [ -x "$ROOT/apps/$1/backend/run" ]
+}
+
+installed() {
+    [ -f "$UNIT_DST" ]
+}
+
+cmd_install() {
+    [ -f "$UNIT_SRC" ] || die "no template unit at $UNIT_SRC"
+
+    # /etc is writable on this device but is *not* preserved across an OS
+    # update: the update writes a fresh root partition and this file is gone,
+    # along with anything else Annex put outside /home. Re-running deploy.sh
+    # after an update is what puts it back, and that is the documented step
+    # rather than a surprise.
+    if cmp -s "$UNIT_SRC" "$UNIT_DST"; then
+        echo "annex-service: template already current"
+        return 0
+    fi
+    cp "$UNIT_SRC" "$UNIT_DST" || die "could not write $UNIT_DST"
+    systemctl daemon-reload || die "daemon-reload failed"
+    echo "annex-service: installed $UNIT_DST"
+}
+
+cmd_enable() {
+    app="$1"
+    installed || cmd_install
+    has_backend "$app" || die "$app has no executable backend/run"
+    systemctl enable "annex-app@$app" >/dev/null 2>&1 \
+        || die "could not enable annex-app@$app"
+    systemctl restart "annex-app@$app" || die "could not start annex-app@$app"
+    echo "annex-service: $app started"
+}
+
+cmd_disable() {
+    app="$1"
+    systemctl stop "annex-app@$app" >/dev/null 2>&1
+    systemctl disable "annex-app@$app" >/dev/null 2>&1
+    rm -f "$ROOT/run/$app.json"
+    echo "annex-service: $app stopped"
+}
+
+# sync makes the running services match what is installed. It is what deploy
+# calls, so adding an app with a backend is a copy and a deploy, and removing
+# one does not leave a service running against a directory that is gone.
+cmd_sync() {
+    installed || cmd_install
+    n=0
+
+    for d in "$ROOT"/apps/*/; do
+        [ -d "$d" ] || continue
+        app=$(basename "$d")
+        if has_backend "$app"; then
+            cmd_enable "$app"
+            n=$((n + 1))
+        else
+            # Only touch it if it is actually enabled, so this stays quiet for
+            # the ordinary case of a QML-only app.
+            if systemctl is-enabled "annex-app@$app" >/dev/null 2>&1; then
+                echo "annex-service: $app no longer has a backend"
+                cmd_disable "$app"
+            fi
+        fi
+    done
+
+    # A service left over from an app that was deleted entirely.
+    for unit in $(systemctl list-units --all --no-legend 'annex-app@*' 2>/dev/null | awk '{print $1}'); do
+        app=${unit#annex-app@}
+        app=${app%.service}
+        [ -n "$app" ] || continue
+        if [ ! -d "$ROOT/apps/$app" ]; then
+            echo "annex-service: $app is gone"
+            cmd_disable "$app"
+        fi
+    done
+
+    echo "annex-service: $n backend(s) running"
+}
+
+cmd_status() {
+    if [ $# -gt 0 ]; then
+        systemctl status "annex-app@$1" --no-pager
+        return
+    fi
+    installed || { echo "annex-service: template not installed"; return; }
+    for d in "$ROOT"/apps/*/; do
+        [ -d "$d" ] || continue
+        app=$(basename "$d")
+        has_backend "$app" || continue
+        state=$(systemctl is-active "annex-app@$app" 2>/dev/null)
+        ep="$ROOT/run/$app.json"
+        if [ -f "$ep" ]; then
+            port=$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' "$ep")
+            echo "$app: $state, port ${port:-unknown}"
+        else
+            echo "$app: $state, no endpoint file"
+        fi
+    done
+}
+
+[ $# -ge 1 ] || die "usage: annex-service install|sync|enable|disable|restart|status|log [app]"
+action="$1"
+shift
+
+case "$action" in
+    install) cmd_install ;;
+    sync)    cmd_sync ;;
+    enable)  [ $# -ge 1 ] || die "enable needs an app id";  cmd_enable "$1" ;;
+    disable) [ $# -ge 1 ] || die "disable needs an app id"; cmd_disable "$1" ;;
+    restart) [ $# -ge 1 ] || die "restart needs an app id"; systemctl restart "annex-app@$1" ;;
+    status)  cmd_status "$@" ;;
+    log)     [ $# -ge 1 ] || die "log needs an app id"; journalctl -u "annex-app@$1" -f ;;
+    *)       die "unknown action: $action" ;;
+esac

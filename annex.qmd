@@ -1,0 +1,256 @@
+; Annex M2 — the runtime: a host that loads apps from disk, and sidebar
+; entries generated from whatever is installed.
+;
+; M1 proved the one thing that could have killed the design: a host parented
+; inside the navigator draws over the library and *under* an open document, so
+; an app is simply still there when the reader closes. That stacking is bought
+; at the anchor below (LOCATE AFTER ALL) and is not patched afterwards.
+;
+; # Why there is not a single hash in this file
+;
+; qmldiff has two failure modes and they are not equally survivable:
+;
+;   * a **selector that does not match** is logged as "Error while processing
+;     file tree" and the *original* file is returned (src/lib.rs). xochitl runs
+;     on, without Annex. This is the failure we are willing to have.
+;
+;   * a **hashed identifier the hashtab cannot resolve** reaches
+;     `panic!("{:?}", e); // temporary solution.` in
+;     src/parser/diff/hash_processor.rs. A panic inside xochitl is a dead UI.
+;     That is exactly how AppLoad bricked this device on 3.28:
+;     "Couldn't resolve the hashed identifier ... required by AppLoad hooks".
+;
+; **Every identifier here is a name, never a hash.** The panic path is not
+; carefully avoided, it is unreachable. Names also survive an OS bump that
+; hashes do not: the hashtab is per build, the names are not.
+;
+; # The anchors, all four of them
+;
+;   Navigator.qml : FocusScope                                (file root type)
+;   Navigator.qml : AFTER ALL                                 (no anchor)
+;   Sidebar.qml   : FocusScope > ColumnLayout#filterColumn
+;   Sidebar.qml   : ArkControls.SidebarFoldout#integrationsFoldout
+;
+; The two blocks are independent on purpose: if a Sidebar anchor moves, there is
+; no way *in* but the host still installs, which is a recoverable failure rather
+; than a broken device. `annex-retarget` re-derives these; see docs/MAINTENANCE.
+;
+; Comment syntax: `;` is qmldiff's and is only legal *outside* an INSERT block.
+; Inside one the content is QML, where `;` separates statements — a `;` comment
+; there is parsed as code and the whole file fails to load with "expected item
+; assignment value token". Use `//` inside INSERT blocks.
+
+AFFECT `/qml/device/view/navigator/Navigator.qml`
+    TRAVERSE FocusScope
+        ; Reachable from Sidebar.qml as navigator.annexHost. An alias may name
+        ; an id that appears later in the file.
+        LOCATE BEFORE ALL
+        INSERT {
+            property alias annexHost: annexHost
+        }
+
+        ; **The host goes last, inside the navigator.** The whole stacking
+        ; decision, made once, here:
+        ;
+        ;   - last child of the navigator  -> draws over the library chrome
+        ;   - inside the navigator branch  -> the document view, which is later
+        ;                                     in MainView, draws over it
+        ;
+        ; So an app covers the library and steps behind a document the moment
+        ; one opens, with no z value anywhere. AppLoad did this until v0.5.0;
+        ; v0.5.1 moved its parent up to MainView, which is what made the reader
+        ; open *behind* apps and cost a day to work around.
+        LOCATE AFTER ALL
+        INSERT {
+            Item {
+                id: annexHost
+                objectName: "annexHost"
+                anchors.fill: parent
+                visible: false
+
+                // ---- the installed apps -------------------------------------
+                //
+                // Discovered at startup by reading an index written by
+                // `annex-index` and then each app's own manifest. Apps live on
+                // the filesystem and are loaded with file:// URLs — there is no
+                // resource bundle to build, which is the main reason writing an
+                // Annex app is less ceremony than writing an AppLoad one.
+                //
+                // QML_XHR_ALLOW_FILE_READ=1 is set on xochitl by
+                // qt-resource-rebuilder's own drop-in, which is what makes the
+                // reading possible at all.
+
+                property string annexRoot: "/home/root/annex"
+                property var apps: []
+                property string currentId: ""
+
+                function read(path, done) {
+                    var xhr = new XMLHttpRequest();
+                    xhr.onreadystatechange = function() {
+                        if (xhr.readyState !== XMLHttpRequest.DONE) return;
+                        done(xhr.status === 0 || xhr.status === 200 ? xhr.responseText : null);
+                    };
+                    try {
+                        xhr.open("GET", "file://" + path);
+                        xhr.send();
+                    } catch (e) {
+                        console.log("[annex] cannot read " + path + ": " + e);
+                        done(null);
+                    }
+                }
+
+                function discover() {
+                    read(annexRoot + "/apps.index", function(txt) {
+                        if (!txt) {
+                            console.log("[annex] no apps.index; no apps installed");
+                            return;
+                        }
+                        var dirs = txt.split("\n").filter(function(l) {
+                            return l.length > 0 && l.charAt(0) === "/";
+                        });
+                        var found = [];
+                        var pending = dirs.length;
+                        if (pending === 0) { annexHost.apps = []; return; }
+                        for (var i = 0; i < dirs.length; ++i) {
+                            (function(dir) {
+                                annexHost.read(dir + "/manifest.json", function(m) {
+                                    if (m) {
+                                        try {
+                                            var j = JSON.parse(m);
+                                            if (j.id && j.name && j.entry) {
+                                                j.dir = dir;
+                                                found.push(j);
+                                            } else {
+                                                console.log("[annex] " + dir + ": manifest needs id, name and entry");
+                                            }
+                                        } catch (e) {
+                                            console.log("[annex] " + dir + ": bad manifest: " + e);
+                                        }
+                                    }
+                                    if (--pending === 0) {
+                                        found.sort(function(a, b) { return a.name < b.name ? -1 : 1; });
+                                        annexHost.apps = found;
+                                        console.log("[annex] " + found.length + " app(s) installed");
+                                    }
+                                });
+                            })(dirs[i]);
+                        }
+                    });
+                }
+
+                Component.onCompleted: discover()
+
+                // ---- opening and closing an app -----------------------------
+                //
+                // The app contract is deliberately AppLoad's: the root element
+                // may declare `signal close` and `function unloading()`. An app
+                // written for AppLoad needs no change here, which is what makes
+                // porting one a matter of the manifest and the socket path.
+
+                function appById(id) {
+                    for (var i = 0; i < apps.length; ++i)
+                        if (apps[i].id === id) return apps[i];
+                    return null;
+                }
+
+                function open(id) {
+                    var a = appById(id);
+                    if (!a) { console.log("[annex] no such app: " + id); return; }
+                    if (currentId === id && appLoader.item) { visible = true; return; }
+                    closeCurrent();
+                    currentId = id;
+                    console.log("[annex] opening " + id + " from " + a.dir);
+                    appLoader.setSource("file://" + a.dir + "/" + a.entry);
+                    visible = true;
+                }
+
+                function closeCurrent() {
+                    if (appLoader.item && typeof appLoader.item.unloading === "function") {
+                        try { appLoader.item.unloading(); }
+                        catch (e) { console.log("[annex] unloading() threw: " + e); }
+                    }
+                    appLoader.setSource("");
+                    currentId = "";
+                }
+
+                function close() {
+                    visible = false;
+                    closeCurrent();
+                }
+
+                Rectangle {
+                    anchors.fill: parent
+                    color: "white"
+
+                    // Swallow taps so the library underneath cannot be operated
+                    // through an app that is covering it.
+                    MouseArea { anchors.fill: parent }
+
+                    Loader {
+                        id: appLoader
+                        anchors.fill: parent
+                        asynchronous: false
+
+                        onLoaded: {
+                            if (!item) return;
+                            // An app closes itself by emitting `close`, exactly
+                            // as under AppLoad.
+                            if (item.close && typeof item.close.connect === "function")
+                                item.close.connect(annexHost.close);
+                            // Hand the app its own directory so it can find its
+                            // own files without knowing where Annex installed it.
+                            var a = annexHost.appById(annexHost.currentId);
+                            if (a && item.annexAppDir !== undefined)
+                                item.annexAppDir = a.dir;
+                        }
+
+                        onStatusChanged: {
+                            if (status === Loader.Error)
+                                console.log("[annex] failed to load " + annexHost.currentId + ": " + sourceComponent);
+                        }
+                    }
+
+                    // Shown only when an app is open but produced no UI — a
+                    // loader error would otherwise be a white screen with no
+                    // explanation on a device with no console.
+                    Text {
+                        anchors.centerIn: parent
+                        width: parent.width - 160
+                        wrapMode: Text.WordWrap
+                        horizontalAlignment: Text.AlignHCenter
+                        font.pixelSize: 34
+                        visible: appLoader.status === Loader.Error
+                        text: "Annex could not load “" + annexHost.currentId + "”.\n\nIts entry QML failed to load. The reason is in the log."
+                    }
+                }
+            }
+        }
+    END TRAVERSE
+END AFFECT
+
+AFFECT `/qml/device/view/navigator/Sidebar.qml`
+    TRAVERSE FocusScope > ColumnLayout#filterColumn
+        ; One entry per installed app, generated from the manifests rather than
+        ; written here. Adding an app is dropping a directory and re-running
+        ; `annex-index`; this file does not change.
+        LOCATE AFTER ArkControls.SidebarFoldout#integrationsFoldout
+        INSERT {
+            Repeater {
+                id: annexEntries
+                objectName: "annexEntries"
+                model: navigator.annexHost ? navigator.annexHost.apps : []
+
+                delegate: ArkControls.SidebarItem {
+                    objectName: "annexEntry_" + modelData.id
+                    text: modelData.name
+                    enabled: true
+                    Layout.preferredWidth: parent.width
+                    onClicked: {
+                        root.toggle();
+                        navigator.annexHost.open(modelData.id);
+                    }
+                }
+            }
+        }
+    END TRAVERSE
+END AFFECT

@@ -1,0 +1,62 @@
+# An Annex app's backend. One template, instantiated per app:
+#
+#     systemctl enable --now annex-app@quire
+#
+# Apps do not ship unit files. The framework provides this one, and an app
+# that wants a backend puts an executable at apps/<id>/backend/run — a binary
+# or a script that execs one. There is no path to configure and nothing for
+# systemd to parse out of the manifest, which is deliberate: the alternative
+# was a shell wrapper picking a field out of JSON under busybox, and that is
+# a quoting bug waiting to happen.
+
+[Unit]
+Description=Annex app backend: %i
+Documentation=file:///home/root/annex/README.md
+
+# /home is encrypted and mounts late. A backend started before it is there
+# finds no app directory, no state and nowhere to write its endpoint file —
+# the same thing that bites xovi itself on a cold boot.
+After=home.mount local-fs.target network.target
+Wants=home.mount
+
+# The backend is useful on its own (Quire keeps downloading with the app
+# closed), so this deliberately does not require xochitl.
+
+[Service]
+Type=simple
+WorkingDirectory=/home/root/annex/apps/%i
+ExecStart=/home/root/annex/apps/%i/backend/run
+
+Environment=ANNEX_APP_ID=%i
+Environment=ANNEX_ROOT=/home/root/annex
+Environment=ANNEX_RUN=/home/root/annex/run
+Environment=ANNEX_APP_DIR=/home/root/annex/apps/%i
+
+# A backend that dies is restarted, because the user's answer to "it stopped"
+# should not have to be SSH. RestartSec is 2 rather than 0 so a backend that
+# cannot start at all — a missing library, a corrupt state file — fails in a
+# visible loop instead of spinning the CPU on a battery-powered device.
+Restart=on-failure
+RestartSec=2
+
+# But a backend failing over and over is a broken install, not something to
+# retry forever. After this it stays down, the endpoint file stays gone, and
+# the app's screen says the backend is not running — which is the truth and
+# is more use than a silent restart loop.
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# Ordinary termination: the transport turns SIGTERM into a clean shutdown, and
+# a download mid-flight needs a moment to put its state file down.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# The backend writes its own endpoint file; remove a stale one if it was
+# killed hard, so a frontend never reads a port that stopped answering.
+ExecStopPost=/bin/sh -c 'rm -f /home/root/annex/run/%i.json'
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

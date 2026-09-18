@@ -1,0 +1,22 @@
+#!/bin/sh
+# Put Annex back after annex-disable.
+set -u
+
+ROOT="${ANNEX_ROOT:-/home/root/annex}"
+QMD="${ANNEX_QMD:-/home/root/xovi/exthome/qt-resource-rebuilder/annex.qmd}"
+
+if [ -f "$QMD.disabled" ]; then
+    mv "$QMD.disabled" "$QMD"
+    echo "annex-enable: restored $QMD"
+elif [ -f "$QMD" ]; then
+    echo "annex-enable: already enabled"
+else
+    echo "annex-enable: nothing to restore; reinstall with deploy.sh" >&2
+    exit 1
+fi
+
+# annex-disable stopped the backends; bring back the ones that should run.
+[ -x "$ROOT/tools/annex-service" ] && "$ROOT/tools/annex-service" sync
+
+systemctl restart xochitl
+echo "annex-enable: xochitl restarted with Annex"

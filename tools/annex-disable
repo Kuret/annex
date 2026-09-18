@@ -1,0 +1,37 @@
+#!/bin/sh
+# Remove Annex from xochitl, completely, in one command.
+#
+# This is the escape hatch, and it is a script rather than a line in a README
+# because the moment you need it is the moment the screen is not helping you.
+# It removes only the injection: apps, their data and the framework library
+# stay where they are, so re-enabling is `annex-enable` and nothing is lost.
+#
+# SSH is independent of xochitl — both network interfaces are brought up by
+# systemd — so this works even when the UI is wedged or crash-looping.
+set -u
+
+ROOT="${ANNEX_ROOT:-/home/root/annex}"
+QMD="${ANNEX_QMD:-/home/root/xovi/exthome/qt-resource-rebuilder/annex.qmd}"
+
+if [ -f "$QMD" ]; then
+    mv "$QMD" "$QMD.disabled"
+    echo "annex-disable: moved $QMD aside"
+else
+    echo "annex-disable: nothing installed at $QMD"
+fi
+
+# Backends are systemd services and outlive xochitl by design, so removing the
+# injection is not enough to stop them — without this, disabling Annex would
+# leave every app backend running with no way to reach it.
+if [ -x "$ROOT/tools/annex-service" ]; then
+    for d in "$ROOT"/apps/*/; do
+        [ -d "$d" ] || continue
+        app=$(basename "$d")
+        if systemctl is-enabled "annex-app@$app" >/dev/null 2>&1; then
+            "$ROOT/tools/annex-service" disable "$app"
+        fi
+    done
+fi
+
+systemctl restart xochitl
+echo "annex-disable: xochitl restarted without Annex"

@@ -1,0 +1,35 @@
+#!/bin/sh
+# Rewrite the app index that the host reads at startup.
+#
+# The index is a newline-delimited list of absolute app directories, and
+# nothing else. It is deliberately not JSON: this runs under busybox, where
+# building JSON in shell means quoting bugs, and the host is already doing one
+# XHR per app to read the manifests. A list of paths has nothing to get wrong.
+#
+# Run it after adding or removing an app, then restart xochitl.
+set -u
+
+ROOT="${ANNEX_ROOT:-/home/root/annex}"
+OUT="$ROOT/apps.index"
+
+[ -d "$ROOT/apps" ] || { echo "annex-index: no $ROOT/apps" >&2; exit 1; }
+
+tmp="$OUT.new"
+: > "$tmp"
+
+n=0
+for d in "$ROOT"/apps/*/; do
+    [ -d "$d" ] || continue
+    d="${d%/}"
+    if [ ! -f "$d/manifest.json" ]; then
+        echo "annex-index: skipping $d (no manifest.json)" >&2
+        continue
+    fi
+    echo "$d" >> "$tmp"
+    n=$((n + 1))
+done
+
+# Written atomically: the host may be reading the index while this runs, and a
+# half-written index is an app list with a truncated path in it.
+mv "$tmp" "$OUT"
+echo "annex-index: $n app(s)"

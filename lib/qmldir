@@ -1,0 +1,18 @@
+# Annex's shared component library.
+#
+# An app reaches it by relative path from its own ui/ directory:
+#
+#     import "../../../lib"
+#
+# which resolves to /home/root/annex/lib. That is a plain local directory
+# import, so this file is not strictly required — Qt exposes the .qml files in
+# a local directory as types either way. It is here because it makes the
+# module's surface explicit: what is listed is what apps may rely on, and
+# anything added to lib/ without a line here is an implementation detail
+# rather than a promise.
+#
+# Style.js is deliberately absent. It is imported as a file
+# (`import "../../../lib/Style.js" as Style`), not as a type, and listing a JS
+# resource here would only be true if apps imported it as a singleton.
+
+Backend 1.0 Backend.qml
