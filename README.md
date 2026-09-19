@@ -7,6 +7,47 @@ An app is a directory with a manifest and a QML file. There is no build step,
 no resource bundle and no registration call — you drop it in and re-run the
 index.
 
+## Install
+
+Plug the tablet in over USB and run this **on your computer** — it drives the
+device over ssh, so if the device has no ssh key it asks for its password once:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Kuret/annex/main/install.sh | sh
+```
+
+### What this does to your device
+
+You are entitled to know before piping a script into a shell. It:
+
+- **installs xovi and its `qt-resource-rebuilder` extension** into
+  `/home/root/xovi`, from the pinned upstream release bundle, if they are not
+  already there. An xovi you already have is left alone.
+- **adds two systemd drop-ins to `xochitl.service`**: one setting
+  `LD_PRELOAD`/`XOVI_ROOT` so xochitl loads xovi, one ordering it after
+  `/home` is mounted.
+- **installs Annex** under `/home/root/annex`, and one QML patch file
+  (`annex.qmd`) where the extension looks for it.
+- **installs two systemd units**: a template for app backends, and one that
+  restores `qt-resource-rebuilder` at boot if a package manager removes it.
+- **restarts xochitl once**, at the end, and checks three things in the journal
+  to prove Annex actually loaded.
+- **asks — never assumes — whether to add your ssh public key**, if the device
+  has none, so later runs need no password.
+
+It does not touch xochitl's binary, your documents, or the package manager's
+state. It downloads xovi from upstream rather than shipping a copy: that
+binary is GPL-3.0 and Annex redistributes none of it.
+
+Everything in it is idempotent, so running it again is safe and is how you
+update. `sh install.sh --uninstall` reverses all of it except xovi, and leaves
+your apps and their data in place.
+
+Annex is developed and tested against **OS 3.28.0.172** on a reMarkable Paper
+Pro. On any other build the installer warns and asks before continuing.
+
+**Writing an app:** [`docs/APPS.md`](docs/APPS.md).
+
 That is measured, not aspirational. On 3.28.0.172 the host loaded an app's QML
 straight off the filesystem, and QML's own source attribution proves where the
 running code came from:
@@ -150,12 +191,20 @@ annex-service status      # what is running, and on which port
 annex-service log myapp   # follow its journal
 ```
 
-## Installing
+## Installing from a checkout
+
+`install.sh` is the user path: no checkout, no xovi, one ssh password prompt.
+`deploy.sh` is the developer path — it assumes the device already has xovi and
+Annex, and only pushes the tree:
 
 ```sh
 ./deploy.sh                       # copies lib, tools and apps to the tablet
 ssh root@10.11.99.1 'systemctl restart xochitl'
 ```
+
+The two share their device-side half, `tools/annex-apply`, so "installed"
+means one thing and is defined in one place. `install.sh` run from a checkout
+uses the checkout rather than downloading.
 
 Adding an app later is a copy plus `annex-index`; `annex.qmd` never changes.
 
@@ -208,7 +257,8 @@ sidebar. No error, no log line, nothing to explain it. `/etc/apk/world`, the
 set of explicitly-wanted packages that survives orphan cleanup, is empty on
 this device, so anything else that owns the extension can do it again.
 
-So `deploy.sh` keeps a copy: `annex-extension vendor` copies the live
+So every install keeps a copy — `annex-apply`, which both `install.sh` and
+`deploy.sh` call, runs `annex-extension vendor`, which copies the live
 `extensions.d/qt-resource-rebuilder.so` to `/home/root/annex/vendor/`, and
 `annex-extension.service` runs `annex-extension restore` at boot, ordered
 `Before=xochitl.service` because the extension is read when xochitl starts. If
@@ -231,16 +281,18 @@ preloaded (cannot open shared object file): ignored.
 ```
 
 "ignored" — the boot succeeds, xochitl runs, and the device is stock with no
-xovi and no Annex. `deploy.sh` installs a drop-in adding `After=home.mount` to
+xovi and no Annex. Installing adds a drop-in with `After=home.mount` to
 `xochitl.service`. It is **ordering only**: if `/home` ever fails to mount, the
 tablet must still come up as stock xochitl rather than wedge with no screen to
 explain itself.
 
 Do not trust `xovi-boot.service` here. It runs `xovi-autostart.sh`, which looks
-for a `start` script xovi 0.3.3 does not ship, logs that it is missing and
-exits 0 — so it reports `active (exited) status=0/SUCCESS` while doing nothing.
+for a `xovi/start` script the **vellum-packaged** xovi does not ship — its
+layout differs from the upstream release tarball — logs that it is missing and
+exits 0, so it reports `active (exited) status=0/SUCCESS` while doing nothing.
 `annex-extension check` calls that out, because a unit that lies by succeeding
-is how this stayed undiagnosed.
+is how this stayed undiagnosed. `install.sh` installs the upstream bundle,
+which has the complete tree.
 
 ### Both survive a reboot
 
@@ -277,6 +329,9 @@ manifest-driven sidebar, and the whole backend transport — which is tested
 end-to-end against the real Quire backend on a development host, but has not
 yet run on the tablet.
 
-Not started: the component library (keyboard, pager, confirm strip) and the
-developer docs. `DESIGN.md` records the decisions and why the alternatives
-were rejected.
+Not started: the component library (keyboard, pager, confirm strip).
+
+`docs/APPS.md` is the developer documentation — the app contract, a walkthrough,
+icons, backends, how Annex compares to AppLoad and Oxide, and what this panel
+will not let you get away with. `DESIGN.md` records the decisions and why the
+alternatives were rejected.

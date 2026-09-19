@@ -430,3 +430,79 @@ the next reboot — the same reboot the boot-ordering drop-in exists to survive,
 which would have made it exactly as reliable as `xovi-boot.service`. Both are
 written under a bind mount of `/`, warning and carrying on if that is
 unavailable. Only these two tiny files; the rootfs is ~90% full.
+
+---
+
+## 16. The installer runs on the computer, not on the device
+
+`install.sh` is a script the *user's machine* runs, driving the tablet over
+ssh. It is not copied to the device and executed there.
+
+That is the decision everything else in it follows from, and it is bought by
+one fact: **most devices have no ssh key on them.** A script running on the
+device cannot ask for the device's own password; a script running here can, by
+letting `ssh` ask, which it does on `/dev/tty`.
+
+**One ssh master connection, not one per command.** With
+`ControlMaster`/`ControlPath`/`ControlPersist`, the password is typed once and
+every subsequent step reuses the open channel — around twenty commands in a
+full install. Without it the same install is twenty password prompts, which is
+not a thing anybody completes. The master is opened with `-f`, which
+authenticates *before* backgrounding, so the prompt happens at a predictable
+moment and nowhere else. The installer says which mode it detected, because
+"unattended" and "you will be asked once" are different promises. It offers to
+install the user's public key and never requires it.
+
+**Every prompt reads `/dev/tty`.** In the advertised `curl … | sh` one-liner
+the script *is* stdin, so a `read` without this eats the rest of the installer
+and runs half of it. That is the classic failure mode for piped installers, not
+a hypothetical one.
+
+**It fetches the repository itself**, into a temp directory it removes on exit,
+and uses a checkout instead when `annex.qmd` sits beside the script. The second
+case is for whoever is changing the installer; the first is what users do.
+
+**xovi comes from the upstream release bundle, pinned to a tag.** The bundle
+ships the complete tree — `xovi.so`, `extensions.d/qt-resource-rebuilder.so`,
+the `services/xochitl.service/` tree, `start`, `scripts/` — in the layout a
+working device has, so there is nothing to assemble and nothing to guess. It
+also avoids the defect in the packaged alternative: the vellum-packaged xovi is
+laid out differently and has no `xovi/start`, which is the file
+`xovi-autostart.sh` looks for, so on those devices `xovi-boot.service` succeeds
+while doing nothing (§15).
+
+Rejected: *downloading `xovi.so` alone and building the tree here*. That is a
+layout copied off one device and reimplemented in shell, wrong the moment
+upstream changes it.
+
+Rejected: *tracking `latest`*. An upstream release would then change what an
+install produces with no change here, and two people running the same command
+would get different devices. The tag is one variable at the top of the script,
+overridable by an environment variable. It is currently a pre-release, because
+that is what upstream publishes for aarch64.
+
+Rejected: *committing xovi or the extension to this repository*. They are
+GPL-3.0 third-party binaries; fetching the official build at install time means
+Annex redistributes none of it. Same reasoning as §15's refusal to commit the
+vendored copy, and it should survive anyone's urge to make the installer work
+offline.
+
+Rejected: *overwriting an existing xovi*. Someone else's extensions and their
+`exthome` data are theirs. When xovi is already present only the one member
+Annex needs is extracted, and the installer says so.
+
+**The device-side half is one script, `tools/annex-apply`.** `install.sh` and
+`deploy.sh` both call it, so "installed" has a single definition rather than
+two copies that drift. Everything else the two do is genuinely different —
+one authenticates and bootstraps xovi, the other assumes a working device — and
+sharing more than this would mean a shell library in service of six lines.
+
+**`--uninstall` leaves xovi alone and leaves apps alone.** It removes Annex's
+units, under the overlay as well as in `/etc` or they return at the next boot,
+and prints the one command that deletes app data rather than deciding on
+somebody's behalf that their reading state is disposable.
+
+**Status: written, statically checked, never run end to end.** No device was
+reachable while writing it. `sh -n` and `shellcheck` pass on it and on every
+tool it calls, and the unreachable-host path is the only one that has been
+executed. Treat the first real run as the test it is.
