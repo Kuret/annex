@@ -22,6 +22,25 @@ Wants=home.mount
 # The backend is useful on its own (Quire keeps downloading with the app
 # closed), so this deliberately does not require xochitl.
 
+# But a backend failing over and over is a broken install, not something to
+# retry forever. After this it stays down, the endpoint file stays gone, and
+# the app's screen says the backend is not running — which is the truth and is
+# more use than a silent restart loop.
+#
+# **These live in [Unit], not [Service].** They were in [Service] until
+# 2026-09-19, where systemd ignores them outright:
+#
+#   annex-app@.service:47: Unknown key 'StartLimitIntervalSec' in section
+#   [Service], ignoring
+#
+# So the limit above was never in force and a broken backend would have
+# restarted for ever, which is the opposite of what this comment promised.
+# Found by running `systemd-analyze verify` on the device; it is worth running
+# after any change here, because systemd's response to a misplaced key is a log
+# line and otherwise doing what you did not ask for.
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
 [Service]
 Type=simple
 WorkingDirectory=/home/root/annex/apps/%i
@@ -39,12 +58,6 @@ Environment=ANNEX_APP_DIR=/home/root/annex/apps/%i
 Restart=on-failure
 RestartSec=2
 
-# But a backend failing over and over is a broken install, not something to
-# retry forever. After this it stays down, the endpoint file stays gone, and
-# the app's screen says the backend is not running — which is the truth and
-# is more use than a silent restart loop.
-StartLimitBurst=5
-StartLimitIntervalSec=60
 
 # Ordinary termination: the transport turns SIGTERM into a clean shutdown, and
 # a download mid-flight needs a moment to put its state file down.

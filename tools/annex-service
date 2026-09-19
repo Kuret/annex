@@ -28,21 +28,109 @@ installed() {
     [ -f "$UNIT_DST" ]
 }
 
+# ---------------------------------------------------------------------------
+# Persistence: writing to /etc is not enough
+#
+# `/etc` on this device is an overlay whose upper layer is tmpfs:
+#
+#     overlay on /etc type overlay (lowerdir=/etc,upperdir=/var/volatile/etc)
+#     tmpfs on /var/volatile type tmpfs
+#
+# So `cp` to /etc and `systemctl enable` both appear to work, survive as long
+# as the device is up, and are **gone after a reboot**. This was found the hard
+# way on 2026-09-18: the tablet rebooted and came back with no unit template,
+# so no app backend started, and Quire's screen would have said its backend was
+# not running with nothing obviously wrong.
+#
+# To persist, write *underneath* the overlay through a bind mount of `/`. This
+# is the same technique xovi's own boot unit uses on this device.
+#
+# The rootfs is ~90% full with tens of megabytes free, so only tiny files may
+# ever go here: a unit file and a symlink, nothing else. Everything Annex
+# actually consists of lives on /home.
+#
+# `mount -o remount,ro /` afterwards reports "busy" — the /etc overlay holds
+# lowerdir=/etc on it — which is expected; fstab restores ro at the next boot.
+# Never `umount -R /etc`: it rips out the /etc/dropbear bind mount holding the
+# SSH host key and wedges ssh.
+
+bind_root() {
+    mount -o remount,rw / 2>/dev/null
+    b=$(mktemp -d 2>/dev/null) || return 1
+    if mount --bind / "$b" 2>/dev/null; then
+        echo "$b"
+        return 0
+    fi
+    rmdir "$b" 2>/dev/null
+    return 1
+}
+
+bind_root_close() {
+    sync
+    umount "$1" 2>/dev/null
+    rmdir "$1" 2>/dev/null
+}
+
+# Every one of these warns and carries on rather than failing. A backend that
+# runs now but not after a reboot is worth having; refusing to start one
+# because it cannot be made permanent is not.
+persist_unit() {
+    b=$(bind_root) || {
+        echo "annex-service: warning: cannot bind-mount /; $UNIT_DST will not survive a reboot" >&2
+        return 1
+    }
+    if ! cmp -s "$UNIT_SRC" "$b$UNIT_DST"; then
+        mkdir -p "$b/etc/systemd/system" 2>/dev/null
+        if cp "$UNIT_SRC" "$b$UNIT_DST" 2>/dev/null; then
+            echo "annex-service: persisted $UNIT_DST"
+        else
+            echo "annex-service: warning: could not persist $UNIT_DST" >&2
+        fi
+    fi
+    bind_root_close "$b"
+}
+
+persist_enable() {
+    app="$1"
+    b=$(bind_root) || {
+        echo "annex-service: warning: cannot bind-mount /; $app will not start after a reboot" >&2
+        return 1
+    }
+    want="$b/etc/systemd/system/multi-user.target.wants/annex-app@$app.service"
+    if [ ! -e "$want" ]; then
+        mkdir -p "$b/etc/systemd/system/multi-user.target.wants" 2>/dev/null
+        # The symlink target is the template itself, which is what systemd
+        # writes for an instantiated unit.
+        if ln -s "$UNIT_DST" "$want" 2>/dev/null; then
+            echo "annex-service: persisted annex-app@$app"
+        else
+            echo "annex-service: warning: could not persist annex-app@$app" >&2
+        fi
+    fi
+    bind_root_close "$b"
+}
+
+persist_disable() {
+    app="$1"
+    b=$(bind_root) || return 1
+    rm -f "$b/etc/systemd/system/multi-user.target.wants/annex-app@$app.service" 2>/dev/null
+    bind_root_close "$b"
+}
+
 cmd_install() {
     [ -f "$UNIT_SRC" ] || die "no template unit at $UNIT_SRC"
 
-    # /etc is writable on this device but is *not* preserved across an OS
-    # update: the update writes a fresh root partition and this file is gone,
-    # along with anything else Annex put outside /home. Re-running deploy.sh
-    # after an update is what puts it back, and that is the documented step
-    # rather than a surprise.
     if cmp -s "$UNIT_SRC" "$UNIT_DST"; then
         echo "annex-service: template already current"
-        return 0
+    else
+        cp "$UNIT_SRC" "$UNIT_DST" || die "could not write $UNIT_DST"
+        systemctl daemon-reload || die "daemon-reload failed"
+        echo "annex-service: installed $UNIT_DST"
     fi
-    cp "$UNIT_SRC" "$UNIT_DST" || die "could not write $UNIT_DST"
-    systemctl daemon-reload || die "daemon-reload failed"
-    echo "annex-service: installed $UNIT_DST"
+
+    # Always, even when the live copy was already current: the overlay copy
+    # being right says nothing about whether the one underneath it exists.
+    persist_unit
 }
 
 cmd_enable() {
@@ -52,6 +140,7 @@ cmd_enable() {
     systemctl enable "annex-app@$app" >/dev/null 2>&1 \
         || die "could not enable annex-app@$app"
     systemctl restart "annex-app@$app" || die "could not start annex-app@$app"
+    persist_enable "$app"
     echo "annex-service: $app started"
 }
 
@@ -59,6 +148,7 @@ cmd_disable() {
     app="$1"
     systemctl stop "annex-app@$app" >/dev/null 2>&1
     systemctl disable "annex-app@$app" >/dev/null 2>&1
+    persist_disable "$app"
     rm -f "$ROOT/run/$app.json"
     echo "annex-service: $app stopped"
 }
@@ -67,7 +157,12 @@ cmd_disable() {
 # calls, so adding an app with a backend is a copy and a deploy, and removing
 # one does not leave a service running against a directory that is gone.
 cmd_sync() {
-    installed || cmd_install
+    # Unconditionally, not `installed || cmd_install`. That check asks whether
+    # the *overlay* copy exists, which says nothing about the one underneath it
+    # — and the overlay copy is exactly the one a reboot throws away. Asking the
+    # question that way is how a synced device came back from a reboot with no
+    # template at all. cmd_install is idempotent.
+    cmd_install
     n=0
 
     for d in "$ROOT"/apps/*/; do
