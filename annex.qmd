@@ -24,16 +24,19 @@
 ; carefully avoided, it is unreachable. Names also survive an OS bump that
 ; hashes do not: the hashtab is per build, the names are not.
 ;
-; # The anchors, all four of them
+; # The anchors, all five of them
 ;
-;   Navigator.qml : FocusScope                                (file root type)
-;   Navigator.qml : AFTER ALL                                 (no anchor)
-;   Sidebar.qml   : FocusScope > ColumnLayout#filterColumn
-;   Sidebar.qml   : ArkControls.SidebarFoldout#integrationsFoldout
+;   Navigator.qml      : FocusScope                           (file root type)
+;   Navigator.qml      : AFTER ALL                            (no anchor)
+;   Sidebar.qml        : FocusScope > ColumnLayout#filterColumn
+;   Sidebar.qml        : ArkControls.SidebarFoldout#integrationsFoldout
+;   GesturesWindow.qml : BaseView > Item#globalGestures
 ;
-; The two blocks are independent on purpose: if a Sidebar anchor moves, there is
-; no way *in* but the host still installs, which is a recoverable failure rather
-; than a broken device. `annex-retarget` re-derives these; see docs/MAINTENANCE.
+; The blocks are independent on purpose, and they degrade in that order: if a
+; Sidebar anchor moves there is no way *in* but the host still installs; if a
+; gestures anchor moves the apps still run and only the escape gesture is lost.
+; Each is a recoverable failure rather than a broken device. `annex-retarget`
+; re-derives these; see docs/MAINTENANCE.
 ;
 ; Comment syntax: `;` is qmldiff's and is only legal *outside* an INSERT block.
 ; Inside one the content is QML, where `;` separates statements — a `;` comment
@@ -111,27 +114,43 @@ AFFECT `/qml/device/view/navigator/Navigator.qml`
                         var found = [];
                         var pending = dirs.length;
                         if (pending === 0) { annexHost.apps = []; return; }
+                        function done() {
+                            if (--pending > 0)
+                                return;
+                            found.sort(function(a, b) { return a.name < b.name ? -1 : 1; });
+                            annexHost.apps = found;
+                            console.log("[annex] " + found.length + " app(s) installed");
+                        }
+
                         for (var i = 0; i < dirs.length; ++i) {
                             (function(dir) {
                                 annexHost.read(dir + "/manifest.json", function(m) {
-                                    if (m) {
-                                        try {
-                                            var j = JSON.parse(m);
-                                            if (j.id && j.name && j.entry) {
-                                                j.dir = dir;
-                                                found.push(j);
-                                            } else {
-                                                console.log("[annex] " + dir + ": manifest needs id, name and entry");
-                                            }
-                                        } catch (e) {
-                                            console.log("[annex] " + dir + ": bad manifest: " + e);
-                                        }
+                                    if (!m) { done(); return; }
+                                    var j;
+                                    try {
+                                        j = JSON.parse(m);
+                                    } catch (e) {
+                                        console.log("[annex] " + dir + ": bad manifest: " + e);
+                                        done();
+                                        return;
                                     }
-                                    if (--pending === 0) {
-                                        found.sort(function(a, b) { return a.name < b.name ? -1 : 1; });
-                                        annexHost.apps = found;
-                                        console.log("[annex] " + found.length + " app(s) installed");
+                                    if (!j.id || !j.name || !j.entry) {
+                                        console.log("[annex] " + dir + ": manifest needs id, name and entry");
+                                        done();
+                                        return;
                                     }
+                                    j.dir = dir;
+
+                                    // `icon` is a path relative to the app's own
+                                    // directory, made absolute here so the
+                                    // delegate has nothing to work out. See the
+                                    // note on iconSource in the Sidebar block
+                                    // for the one rule that matters: no scheme.
+                                    if (j.icon)
+                                        j.iconPath = dir + "/" + j.icon;
+
+                                    found.push(j);
+                                    done();
                                 });
                             })(dirs[i]);
                         }
@@ -213,15 +232,48 @@ AFFECT `/qml/device/view/navigator/Navigator.qml`
                     // Shown only when an app is open but produced no UI — a
                     // loader error would otherwise be a white screen with no
                     // explanation on a device with no console.
-                    Text {
+                    Column {
                         anchors.centerIn: parent
-                        width: parent.width - 160
-                        wrapMode: Text.WordWrap
-                        horizontalAlignment: Text.AlignHCenter
-                        font.pixelSize: 34
+                        spacing: 60
                         visible: appLoader.status === Loader.Error
-                        text: "Annex could not load “" + annexHost.currentId + "”.\n\nIts entry QML failed to load. The reason is in the log."
+
+                        Text {
+                            width: annexHost.width - 160
+                            wrapMode: Text.WordWrap
+                            horizontalAlignment: Text.AlignHCenter
+                            font.pixelSize: 34
+                            text: "Annex could not load \"" + annexHost.currentId +
+                                  "\".\n\nIts entry QML failed to load. The reason is in the log."
+                        }
+
+                        // An explicit way out, here and nowhere else.
+                        //
+                        // The swipe is the universal hatch, but a user who has
+                        // just been handed an error screen should not also have
+                        // to know a gesture. This is the one screen where a
+                        // host-drawn control is safe to put anywhere it likes:
+                        // the app failed to load, so there is no app content to
+                        // be in a fight with.
+                        Text {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            font.pixelSize: 34
+                            font.underline: true
+                            color: leaveArea.pressed ? "#909090" : "#000000"
+                            text: "Back to library"
+
+                            MouseArea {
+                                id: leaveArea
+                                anchors.fill: parent
+                                anchors.margins: -40
+                                onClicked: annexHost.close()
+                            }
+                        }
                     }
+
+                    // The escape hatch is not here. It is xochitl's own
+                    // swipe-from-the-top filter, attached in the third AFFECT
+                    // block at the bottom of this file — see the long note
+                    // there for why it moved out of this one.
                 }
             }
         }
@@ -245,10 +297,176 @@ AFFECT `/qml/device/view/navigator/Sidebar.qml`
                     text: modelData.name
                     enabled: true
                     Layout.preferredWidth: parent.width
+
+                    // An app's own icon, from its manifest, beside xochitl's.
+                    //
+                    // **An absolute path with no scheme.** This slot is not a
+                    // plain Image: SidebarItem hands the source to an ark
+                    // `Icon`, which calls
+                    // `ArkImageDataProvider.resolveImageInfo(source, ...)` and
+                    // renders the SVG itself. That provider takes a filesystem
+                    // path or a `qrc:` path and nothing else. Measured against
+                    // it directly on 3.28.0.172:
+                    //
+                    //   /home/root/annex/apps/quire/icon.svg   -> 48x48   ok
+                    //   file:///home/root/annex/apps/quire/icon.svg -> -1x-1
+                    //   qrc:/ark/icons/ebook                   -> 48x48   ok
+                    //
+                    // So a `file://` URL fails, and so does a data: URI — both
+                    // report "Could not find", which reads like a missing file
+                    // and is really an unsupported source. An app therefore
+                    // ships its icon as a plain file in its own directory and
+                    // needs no resource bundle for it.
+                    //
+                    // The stock icons are 48x48 SVGs of solid black paths, and
+                    // an app matching that sits in the sidebar looking like it
+                    // belongs. `icon` is optional: without one the source is
+                    // empty, the ark Icon makes itself invisible, and the entry
+                    // looks exactly as it did before icons existed.
+                    iconSource: modelData.iconPath ? modelData.iconPath : ""
+
                     onClicked: {
                         root.toggle();
                         navigator.annexHost.open(modelData.id);
                     }
+                }
+            }
+        }
+    END TRAVERSE
+END AFFECT
+
+; ============================================================================
+; The escape hatch: xochitl's own gesture, not one of ours
+; ============================================================================
+;
+; **Swipe down from the top edge to leave an app.** Not a lookalike — this is
+; literally the mechanism xochitl uses to leave a document, with its own
+; thresholds and its own edge band.
+;
+; # Why the host draws nothing
+;
+; Annex covers the whole navigator, the sidebar included, so the only exit from
+; an app used to be the app choosing to offer one. That made "can the user
+; leave?" a property of every app written by anybody, which is not a promise a
+; framework keeps by asking nicely. Annex's own Loader.Error screen proved the
+; point: full-screen, no affordance, so an app with a QML syntax error left the
+; device needing ssh to recover.
+;
+; The first fix was a host-drawn X in a reserved corner. On hardware it failed
+; twice over: the glyph was U+2715, which this device's font does not have, so
+; it drew as a tofu box — and app content drew on top of it anyway, z and all.
+; Both are one problem. *Anything the host draws is in a fight with the app over
+; the same pixels*, and the host only wins that fight if every app author
+; remembers a reserved rectangle, which is the promise we were trying to stop
+; depending on. A gesture takes no pixels: nothing to collide with, nothing to
+; hide, no glyph to render.
+;
+; # Why this is a TouchAreaSwipeFilter and not a DragHandler
+;
+; A hand-rolled DragHandler was the second attempt and did not fire on device.
+; Rather than debug a gesture of our own invention, this uses the one xochitl
+; already ships. `SceneViewGestures.qml:476` is how a document is closed:
+;
+;     TouchAreaSwipeFilter {
+;         objectName: "close-scene-view"
+;         direction: Qt.point(0, 1)
+;         area: Qt.rect(0, 0, touchArea.width - Values.quickSettingsGestureWidth,
+;                       touchArea.edgeSize)
+;         onTriggered: view.closeGesture();
+;     }
+;
+; The filters attach to an *existing* TouchArea through their `touchArea`
+; property rather than creating one, which is the detail that makes this safe:
+; Annex adds no touch-handling item over the app, so nothing new can swallow an
+; app's taps.
+;
+; The numbers are xochitl's, read off its own library-screen filters: a 0.3 cm
+; swipe, starting inside the top band, across the full width *except* the
+; right-hand strip that belongs to the quick-settings swipe. Users get the
+; gesture they already have, including the corner where it correctly does
+; something else.
+;
+; # Why this file, and a warning about the resource dump
+;
+; `NavigatorWindow.qml` and `GesturesWindow.qml` come out of `rccdump` as
+; byte-identical files (same md5), so which one the engine loads could not be
+; told from the dump. Both were patched with the same selector and the device
+; settled it on 2026-09-18:
+;
+;   Processing /qt/qml/xofm/modules/homescreen/qml/NavigatorWindow.qml...
+;   Error while processing file tree: Cannot locate element in tree:
+;       BaseView > Item#globalGestures
+;   Processing /qt/qml/xofm/modules/gestures/global/qml/GesturesWindow.qml...
+;   [annex] escape swipe armed (GesturesWindow)
+;
+; The selector matched one and not the other, which two identical files cannot
+; both do. **So `rccdump` misattributed NavigatorWindow.qml's contents**, and
+; what that dump shows for a file is not always what xochitl runs. Read it as a
+; strong hint and let the device confirm. The dead block has been removed;
+; GesturesWindow is the live one.
+;
+; This block is independent of the two above: if this anchor moves, apps still
+; install and still run, and only the gesture is lost.
+;
+; # What it does not cover
+;
+; An app that wedges the QML thread receives no gesture either. `annex-disable
+; <id>` over ssh is that backstop and is why the tool exists.
+;
+; Apps are still encouraged to offer their own way back — "< Library" is the
+; discoverable route and is in the app contract. This is the floor under it.
+
+AFFECT `/qt/qml/xofm/modules/gestures/global/qml/GesturesWindow.qml`
+    TRAVERSE BaseView > Item#globalGestures
+        LOCATE AFTER ALL
+        INSERT {
+            QtObject {
+                id: annexEscape
+                property var cached: null
+
+                function host() {
+                    if (annexEscape.cached && annexEscape.cached.objectName === "annexHost")
+                        return annexEscape.cached;
+                    var top = root;
+                    while (top.parent) top = top.parent;
+                    var queue = [top];
+                    var depth = 0;
+                    while (queue.length > 0 && depth < 32) {
+                        var next = [];
+                        for (var i = 0; i < queue.length; ++i) {
+                            var node = queue[i];
+                            if (!node) continue;
+                            if (node.objectName === "annexHost") {
+                                annexEscape.cached = node;
+                                return node;
+                            }
+                            var kids = node.children;
+                            if (!kids) continue;
+                            for (var k = 0; k < kids.length; ++k)
+                                next.push(kids[k]);
+                        }
+                        queue = next;
+                        depth += 1;
+                    }
+                    return null;
+                }
+            }
+
+            TouchAreaSwipeFilter {
+                objectName: "annexEscapeSwipe"
+                touchArea: root.touchArea
+                distance: 0.3 * root.pixelsPerCm
+                direction: Qt.point(0, 1)
+                area: Qt.rect(0, 0,
+                              root.width - globalGestures.quickSettingsGestureAreaWidth,
+                              globalGestures.quickSettingsGestureAreaHeight)
+                Component.onCompleted: console.log("[annex] escape swipe armed (GesturesWindow)")
+                onTriggered: {
+                    var h = annexEscape.host();
+                    console.log("[annex] escape swipe (GesturesWindow): host=" + h +
+                                " visible=" + (h ? h.visible : "n/a"));
+                    if (h && h.visible)
+                        h.close();
                 }
             }
         }
