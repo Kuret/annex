@@ -1,0 +1,35 @@
+# Put qt-resource-rebuilder back before xochitl reads it.
+#
+# Annex is not a vellum package, so nothing in /etc/apk/world records that it
+# depends on qt-resource-rebuilder. On 2026-09-19 removing AppLoad through
+# ReManager purged the extension as an orphan and Annex vanished from the
+# sidebar with no error anywhere. See tools/annex-extension.
+#
+# This unit is the repair half: Annex keeps its own copy under
+# /home/root/annex/vendor and restores it at boot if it is gone.
+
+[Unit]
+Description=Annex: restore qt-resource-rebuilder if a package manager removed it
+Documentation=file:///home/root/annex/README.md
+
+# Both the vendored copy and extensions.d live on the encrypted /home volume,
+# so there is nothing to read before it is mounted.
+After=home.mount
+
+# The whole point of the timing: xovi loads extensions.d when xochitl starts,
+# so restoring it afterwards would need a UI restart to take effect.
+Before=xochitl.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/root/annex/tools/annex-extension restore
+
+# The tool exits 0 when nothing is wrong and when it cannot help (no vendored
+# copy), so a failure here is a real one worth seeing in `systemctl status`.
+RemainAfterExit=yes
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

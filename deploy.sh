@@ -39,8 +39,14 @@ echo "deploy: $USER@$HOST"
 export COPYFILE_DISABLE=1
 TAR_EXCLUDE=(--exclude='._*' --exclude='.DS_Store')
 
-"${SSH[@]}" "mkdir -p $ROOT/apps $ROOT/lib $ROOT/tools $ROOT/run $ROOT/systemd"
-tar "${TAR_EXCLUDE[@]}" -cf - -C "$HERE" lib tools apps systemd README.md | "${SSH[@]}" "tar xf - -C $ROOT"
+# **`examples/` is not deployed, and that is the whole reason it is a separate
+# directory.** The hello app is documentation: it is how a developer sees the
+# smallest thing that works, and it belongs in the repository. It does not
+# belong in somebody's sidebar, where it is a stray entry they have to wonder
+# about. Copy it into `apps/` on the device to try it; nothing here does that
+# for you.
+"${SSH[@]}" "mkdir -p $ROOT/apps $ROOT/lib $ROOT/tools $ROOT/run $ROOT/systemd $ROOT/vendor"
+tar "${TAR_EXCLUDE[@]}" -cf - -C "$HERE" lib tools systemd README.md | "${SSH[@]}" "tar xf - -C $ROOT"
 tar "${TAR_EXCLUDE[@]}" -cf - -C "$HERE" annex.qmd | "${SSH[@]}" "tar xf - -C $QMD_DIR"
 
 # A stale AppleDouble from an earlier deploy is still sitting there.
@@ -54,9 +60,27 @@ tar "${TAR_EXCLUDE[@]}" -cf - -C "$HERE" annex.qmd | "${SSH[@]}" "tar xf - -C $Q
 # wipes /etc.
 "${SSH[@]}" "$ROOT/tools/annex-service sync"
 
+# Take a safety copy of the extension that applies annex.qmd, and install the
+# unit that puts it back.
+#
+# Annex depends on qt-resource-rebuilder and nothing on the device records
+# that, because Annex is not a vellum package — so a package manager removing
+# whatever *does* own it takes Annex with it, silently. That happened on
+# 2026-09-19. tools/annex-extension has the log and the reasoning.
+#
+# The copy is made on the device and stays there: it is a 9 MB third-party GPL
+# binary and it is not going in this repository. /home has tens of gigabytes
+# free; the rootfs, where the unit and drop-in go, has tens of megabytes, which
+# is why only those two tiny files are persisted under the /etc overlay.
+"${SSH[@]}" "$ROOT/tools/annex-extension vendor"
+"${SSH[@]}" "$ROOT/tools/annex-extension install"
+
 echo
 echo "deploy: installed. To load the UI:"
 echo "    ssh $USER@$HOST 'systemctl restart xochitl'"
+echo
+echo "deploy: if the sidebar entry does not appear, ask why in one command:"
+echo "    ssh $USER@$HOST '$ROOT/tools/annex-extension check'"
 echo
 echo "deploy: backend status:"
 echo "    ssh $USER@$HOST '$ROOT/tools/annex-service status'"

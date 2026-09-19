@@ -1,0 +1,333 @@
+#!/bin/sh
+# Keep the extension Annex depends on alive.
+#
+#   annex-extension check      say what is wrong, in words, exit 1 if broken
+#   annex-extension restore    put the extension back from Annex's own copy
+#   annex-extension vendor     refresh Annex's copy from the live one
+#   annex-extension install    install and persist the unit and the drop-in
+#
+# ---------------------------------------------------------------------------
+# Why this exists
+#
+# Annex is applied by xovi's `qt-resource-rebuilder` extension: it reads
+# annex.qmd out of exthome and patches xochitl's QML. Without that .so, Annex
+# is a directory of files nothing loads.
+#
+# Annex is not a vellum package, so **nothing on the device records that it
+# needs the extension**. On 2026-09-19 removing AppLoad through ReManager did:
+#
+#     (1/3) Purging appload
+#     (2/3) Purging xovi-extensions
+#     (3/3) Purging qt-resource-rebuilder
+#
+# AppLoad owned the extension as a dependency; when AppLoad went, the extension
+# went with it as an orphan. Annex left the sidebar with no error, no log line
+# and nothing to explain it. `/etc/apk/world` — the explicitly-wanted set that
+# protects a package from orphan cleanup — is empty on this device, so anything
+# else that happens to own qt-resource-rebuilder can do this again tomorrow.
+#
+# Rejected: writing `qt-resource-rebuilder` into /etc/apk/world ourselves. It
+# is the correct fix for a vellum-managed device and it is not ours to make —
+# /etc/apk/world is the package manager's state, and an Annex deploy silently
+# editing it is how two tools start fighting over one file. `check` reports the
+# empty world file instead, so a human can decide.
+#
+# So Annex keeps its own copy and puts it back. The copy is vendored **on the
+# device**, never in git: it is a 9 MB third-party GPL binary, /home has tens
+# of gigabytes free, and the repository should stay a tree of text.
+set -u
+
+ROOT="${ANNEX_ROOT:-/home/root/annex}"
+XOVI="${ANNEX_XOVI:-/home/root/xovi}"
+
+EXT_NAME=qt-resource-rebuilder.so
+EXT_DIR="$XOVI/extensions.d"
+EXT="$EXT_DIR/$EXT_NAME"
+VENDOR_DIR="$ROOT/vendor"
+VENDOR="$VENDOR_DIR/$EXT_NAME"
+QMD="$XOVI/exthome/qt-resource-rebuilder/annex.qmd"
+
+UNIT_SRC="$ROOT/systemd/annex-extension.service"
+UNIT_DST=/etc/systemd/system/annex-extension.service
+DROPIN_SRC="$ROOT/systemd/xochitl-annex-ordering.conf"
+DROPIN_DIR=/etc/systemd/system/xochitl.service.d
+DROPIN_DST="$DROPIN_DIR/01-annex-wait-for-home.conf"
+
+say()  { echo "annex-extension: $*"; }
+warn() { echo "annex-extension: warning: $*" >&2; }
+die()  { echo "annex-extension: $*" >&2; exit 1; }
+
+# busybox: no `stat -c` worth relying on, no `du --bytes`. `wc -c` is portable
+# and this is only ever used for a human-readable line.
+size_of() { wc -c < "$1" 2>/dev/null | tr -d ' '; }
+
+# ---------------------------------------------------------------------------
+# Persistence
+#
+# /etc here is an overlay with a tmpfs upper layer, so a unit copied into /etc
+# is gone after a reboot — exactly the boot this unit exists to survive. The
+# mechanism and its hazards are documented at length in tools/annex-service;
+# this is the same technique against the same rootfs, and like there it warns
+# and carries on rather than failing, because a fix that works until the next
+# reboot beats refusing to apply one.
+#
+# Only the unit and the drop-in go underneath — a few hundred bytes. The rootfs
+# is ~90% full; the 9 MB .so stays on /home and must never be written here.
+
+bind_root() {
+    mount -o remount,rw / 2>/dev/null
+    b=$(mktemp -d 2>/dev/null) || return 1
+    if mount --bind / "$b" 2>/dev/null; then
+        echo "$b"
+        return 0
+    fi
+    rmdir "$b" 2>/dev/null
+    return 1
+}
+
+bind_root_close() {
+    sync
+    umount "$1" 2>/dev/null
+    rmdir "$1" 2>/dev/null
+}
+
+# src dst  — copy under the overlay, creating the directory.
+persist_file() {
+    src="$1"
+    dst="$2"
+    if ! cmp -s "$src" "$B$dst"; then
+        mkdir -p "$B$(dirname "$dst")" 2>/dev/null
+        if cp "$src" "$B$dst" 2>/dev/null; then
+            say "persisted $dst"
+        else
+            warn "could not persist $dst"
+        fi
+    fi
+}
+
+persist_enable() {
+    want="$B/etc/systemd/system/multi-user.target.wants/annex-extension.service"
+    if [ ! -e "$want" ]; then
+        mkdir -p "$B/etc/systemd/system/multi-user.target.wants" 2>/dev/null
+        if ln -s "$UNIT_DST" "$want" 2>/dev/null; then
+            say "persisted annex-extension.service"
+        else
+            warn "could not persist annex-extension.service"
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------------------
+
+cmd_vendor() {
+    if [ ! -f "$EXT" ]; then
+        # Not an error: `vendor` runs on every deploy, and a device whose
+        # extension is currently missing is the case `restore` handles.
+        say "no live $EXT to vendor from"
+        [ -f "$VENDOR" ] && say "keeping existing copy at $VENDOR"
+        return 0
+    fi
+
+    mkdir -p "$VENDOR_DIR" || die "could not create $VENDOR_DIR"
+
+    if cmp -s "$EXT" "$VENDOR"; then
+        say "vendored copy already current ($(size_of "$VENDOR") bytes)"
+        return 0
+    fi
+
+    # Write beside and rename, so an interrupted copy cannot leave a truncated
+    # .so as the thing restore would put back.
+    cp "$EXT" "$VENDOR.new" || die "could not copy $EXT"
+    chmod 755 "$VENDOR.new" 2>/dev/null
+    mv "$VENDOR.new" "$VENDOR" || die "could not replace $VENDOR"
+    say "vendored $EXT -> $VENDOR ($(size_of "$VENDOR") bytes)"
+}
+
+cmd_restore() {
+    if [ ! -d "$EXT_DIR" ]; then
+        # xovi itself is gone, not just the extension. Creating extensions.d
+        # under an absent xovi would produce a directory nothing reads and a
+        # `check` that looks healthier than the device is.
+        warn "$EXT_DIR does not exist — xovi is not installed; nothing to restore into"
+        return 0
+    fi
+
+    if [ -f "$EXT" ]; then
+        # Idempotent: this is the normal boot, and it should be quiet-ish.
+        say "$EXT_NAME present, nothing to restore"
+        return 0
+    fi
+
+    if [ ! -f "$VENDOR" ]; then
+        warn "$EXT_NAME is MISSING and there is no vendored copy at $VENDOR"
+        warn "Annex will not load. Reinstall qt-resource-rebuilder (xovi), then run: $0 vendor"
+        # Deliberately exit 0: there is nothing this unit can do, and a failed
+        # service at every boot trains people to ignore it. `check` is what
+        # reports the state, loudly, with an exit code.
+        return 0
+    fi
+
+    # Loud on purpose. This line is the entire explanation of why the sidebar
+    # came back, six months from now, in a journal someone is reading for an
+    # unrelated reason.
+    say "$EXT_NAME was MISSING from $EXT_DIR — a package manager most likely removed it"
+    cp "$VENDOR" "$EXT.new" || die "could not write $EXT.new"
+    chmod 755 "$EXT.new" 2>/dev/null
+    mv "$EXT.new" "$EXT" || die "could not install $EXT"
+    say "restored $EXT from $VENDOR ($(size_of "$EXT") bytes)"
+    say "xochitl must start after this for it to take effect"
+}
+
+cmd_install() {
+    [ -f "$UNIT_SRC" ]   || die "no unit at $UNIT_SRC"
+    [ -f "$DROPIN_SRC" ] || die "no drop-in at $DROPIN_SRC"
+
+    # The live /etc copies, so the fix applies without a reboot.
+    if ! cmp -s "$UNIT_SRC" "$UNIT_DST"; then
+        cp "$UNIT_SRC" "$UNIT_DST" || die "could not write $UNIT_DST"
+        say "installed $UNIT_DST"
+    fi
+    mkdir -p "$DROPIN_DIR" || die "could not create $DROPIN_DIR"
+    if ! cmp -s "$DROPIN_SRC" "$DROPIN_DST"; then
+        cp "$DROPIN_SRC" "$DROPIN_DST" || die "could not write $DROPIN_DST"
+        say "installed $DROPIN_DST"
+    fi
+
+    systemctl daemon-reload || warn "daemon-reload failed"
+    systemctl enable annex-extension.service >/dev/null 2>&1 \
+        || warn "could not enable annex-extension.service"
+
+    # Always, even when the live copies were already current: /etc being right
+    # says nothing about whether anything exists underneath the overlay, and
+    # the overlay is what a reboot throws away.
+    B=$(bind_root) || {
+        warn "cannot bind-mount /; the unit and the xochitl drop-in will not survive a reboot"
+        return 0
+    }
+    persist_file "$UNIT_SRC" "$UNIT_DST"
+    persist_file "$DROPIN_SRC" "$DROPIN_DST"
+    persist_enable
+    bind_root_close "$B"
+}
+
+# ---------------------------------------------------------------------------
+# check — the part that exists because both failures were invisible.
+#
+# Exit 1 means Annex is broken or will be after the next boot. Warnings alone
+# exit 0: they are things a human should decide about, not reasons for a deploy
+# to stop.
+
+cmd_check() {
+    bad=0
+
+    if [ ! -d "$XOVI" ]; then
+        echo "xovi:       NOT INSTALLED ($XOVI missing) — Annex cannot load at all"
+        bad=1
+    fi
+
+    if [ -f "$EXT" ]; then
+        echo "extension:  present ($EXT, $(size_of "$EXT") bytes)"
+    elif [ -d "$EXT_DIR" ]; then
+        echo "extension:  MISSING from $EXT_DIR"
+        echo "            Annex is installed but nothing applies it. This is what a"
+        echo "            package manager removing qt-resource-rebuilder looks like."
+        bad=1
+    else
+        echo "extension:  MISSING ($EXT_DIR does not exist)"
+        bad=1
+    fi
+
+    if [ -f "$VENDOR" ]; then
+        if [ ! -f "$EXT" ]; then
+            echo "vendored:   present ($(size_of "$VENDOR") bytes) — recoverable: run '$0 restore'"
+        elif cmp -s "$EXT" "$VENDOR"; then
+            echo "vendored:   present and identical to the live one"
+        else
+            echo "vendored:   present but DIFFERS from the live one"
+            echo "            The live extension was upgraded or replaced since the last"
+            echo "            deploy. Restoring this copy would roll it back; refresh it"
+            echo "            with '$0 vendor'."
+        fi
+    else
+        echo "vendored:   MISSING ($VENDOR)"
+        echo "            Nothing to restore from if the extension is removed again."
+        echo "            Run '$0 vendor' while the live one is still there."
+        [ -f "$EXT" ] || bad=1
+    fi
+
+    if [ -f "$QMD" ]; then
+        echo "annex.qmd:  present"
+    elif [ -f "$QMD.disabled" ]; then
+        echo "annex.qmd:  disabled (annex-disable was run; 'annex-enable' puts it back)"
+    else
+        echo "annex.qmd:  MISSING ($QMD) — deploy.sh has not run, or /home was not mounted"
+        bad=1
+    fi
+
+    # The boot race. Ordering only lives in a drop-in on the tmpfs-backed /etc,
+    # so "it was there yesterday" is not evidence.
+    if [ -f "$DROPIN_DST" ]; then
+        echo "boot order: xochitl waits for home.mount ($DROPIN_DST)"
+    else
+        echo "boot order: DROP-IN MISSING ($DROPIN_DST)"
+        echo "            xochitl may start before /home is mounted, LD_PRELOAD of"
+        echo "            xovi.so then fails with 'cannot be preloaded: ignored' and the"
+        echo "            device comes up as stock xochitl. Re-run deploy.sh."
+        bad=1
+    fi
+
+    if [ -f "$UNIT_DST" ]; then
+        state=$(systemctl is-enabled annex-extension.service 2>/dev/null)
+        echo "self-heal:  annex-extension.service installed (${state:-unknown})"
+    else
+        echo "self-heal:  UNIT MISSING ($UNIT_DST) — the extension will not be restored"
+        echo "            at boot. Re-run deploy.sh."
+        bad=1
+    fi
+
+    # xovi's own boot unit reports `active (exited) status=0/SUCCESS` while
+    # doing nothing at all: xovi-autostart.sh looks for a `start` script that
+    # xovi 0.3.3 does not ship, logs that it is missing and exits 0. Not ours
+    # to fix — but a unit that lies by succeeding is worth naming out loud,
+    # because it is why the boot race went undiagnosed.
+    if [ -f "$XOVI/xovi-autostart.sh" ] && [ ! -e "$XOVI/start" ]; then
+        echo "xovi-boot:  xovi-autostart.sh is a NO-OP ($XOVI/start does not exist)"
+        echo "            xovi-boot.service reports success and does nothing. Do not read"
+        echo "            its green status as evidence that xovi loaded."
+    fi
+
+    # Read-only look at the package manager's state. The purge that started all
+    # of this was legal: an empty world file means nothing is pinned, so any
+    # package that happens to own qt-resource-rebuilder takes it down with it.
+    if [ -f /etc/apk/world ]; then
+        if grep -q '^qt-resource-rebuilder$' /etc/apk/world 2>/dev/null; then
+            echo "apk world:  qt-resource-rebuilder is explicitly wanted (safe from orphan cleanup)"
+        else
+            echo "apk world:  qt-resource-rebuilder is NOT in /etc/apk/world"
+            echo "            Removing whatever package owns it will purge it again, as"
+            echo "            removing AppLoad did on 2026-09-19. Annex does not edit the"
+            echo "            package manager's state; 'apk add qt-resource-rebuilder'"
+            echo "            would pin it, if this device's vellum supports that."
+        fi
+    fi
+
+    if [ "$bad" -ne 0 ]; then
+        echo
+        echo "annex-extension: NOT HEALTHY — see the lines marked MISSING above"
+        return 1
+    fi
+    echo
+    echo "annex-extension: healthy"
+}
+
+[ $# -ge 1 ] || die "usage: annex-extension check|restore|vendor|install"
+action="$1"
+shift
+
+case "$action" in
+    check)   cmd_check ;;
+    restore) cmd_restore ;;
+    vendor)  cmd_vendor ;;
+    install) cmd_install ;;
+    *)       die "unknown action: $action" ;;
+esac

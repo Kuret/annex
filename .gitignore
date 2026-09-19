@@ -1,0 +1,7 @@
+# The safety copy of qt-resource-rebuilder.so is taken from the device at
+# deploy time and stays there. It is 9 MB of third-party GPL binary and has no
+# business in a tree whose premise is that everything here is plain text.
+vendor/
+
+.DS_Store
+._*
