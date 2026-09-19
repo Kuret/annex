@@ -163,6 +163,24 @@ trap cleanup EXIT INT TERM
 # command in this script goes through it, so there is exactly one place where
 # the multiplexing options live.
 dev() {
+    # `-n` is load-bearing, not tidiness. Under the advertised
+    # `curl ... | sh`, this script's stdin is the pipe carrying the script
+    # itself; ssh inherits that stdin and swallows the remainder, so the
+    # install stopped after the first remote command and exited 0 having done
+    # nothing. Measured 2026-09-19 against the published one-liner.
+    ssh -n -o ControlPath="$CM" -o ControlMaster=no "$DEV_USER@$HOST" "$@"
+}
+
+# dev_stdin is dev for the calls that *want* stdin: streaming a tarball into
+# `tar x`, or a file into `cat >` / `cmp -`. It deliberately omits -n.
+#
+# Getting this split wrong is not a subtle failure. `ssh -n` redirects ssh's
+# stdin from /dev/null, which silently overrides a `< file` redirection on the
+# caller — so a `dev "cat > x" < f` wrote a **zero-byte** file, which is how
+# the xovi drop-in came to be empty and xochitl started without LD_PRELOAD on
+# 2026-09-19. Anything that feeds bytes to the device belongs here; everything
+# else belongs in dev, or `curl | sh` eats the rest of the script.
+dev_stdin() {
     ssh -o ControlPath="$CM" -o ControlMaster=no "$DEV_USER@$HOST" "$@"
 }
 
@@ -182,7 +200,7 @@ step "device: $DEV_USER@$HOST"
 
 probe_err="$WORK/probe.err"
 AUTH=""
-if ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new \
+if ssh -n -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new \
        "$DEV_USER@$HOST" true 2>"$probe_err"; then
     AUTH=key
 elif grep -qi 'permission denied\|no supported authentication\|too many authentication' "$probe_err"; then
@@ -427,7 +445,7 @@ else
     dev "mkdir -p /home/root"
     if [ "$XOVI_PRESENT" = no ]; then
         # Nothing to preserve: extract the whole tree.
-        dev "tar xzf - -C /home/root" < "$WORK/xovi.tar.gz" \
+        dev_stdin "tar xzf - -C /home/root" < "$WORK/xovi.tar.gz" \
             || die "could not extract the xovi bundle on the device"
         say "installed $XOVI from the upstream bundle"
     else
@@ -436,7 +454,7 @@ else
         # only thing Annex needs that is missing here is the extension, so that
         # is the only member extracted.
         say "xovi is already installed; extracting only qt-resource-rebuilder"
-        dev "tar xzf - -C /home/root xovi/extensions.d/qt-resource-rebuilder.so" < "$WORK/xovi.tar.gz" \
+        dev_stdin "tar xzf - -C /home/root xovi/extensions.d/qt-resource-rebuilder.so" < "$WORK/xovi.tar.gz" \
             || die "could not extract qt-resource-rebuilder on the device"
     fi
 fi
@@ -526,7 +544,7 @@ export COPYFILE_DISABLE=1
 push() {  # push <dest-dir> <path>...
     dest="$1"; shift
     tar --exclude='._*' --exclude='.DS_Store' -cf - -C "$SRC" "$@" \
-        | dev "tar xf - -C $dest"
+        | dev_stdin "tar xf - -C $dest"
 }
 
 # The tools are pushed here, ahead of the rest of Annex, because the drop-in
@@ -544,10 +562,10 @@ Environment="LD_PRELOAD=$XOVI/xovi.so"
 Environment="XOVI_ROOT=$XOVI/services/xochitl.service/"
 EOF
 
-if dev "cmp -s - $XOVI_DROPIN" < "$WORK/00-xovi.conf"; then
+if dev_stdin "cmp -s - $XOVI_DROPIN" < "$WORK/00-xovi.conf"; then
     say "$XOVI_DROPIN already current"
 else
-    dev "mkdir -p $(dirname "$XOVI_DROPIN") && cat > $XOVI_DROPIN" < "$WORK/00-xovi.conf" \
+    dev_stdin "mkdir -p $(dirname "$XOVI_DROPIN") && cat > $XOVI_DROPIN" < "$WORK/00-xovi.conf" \
         || die "could not write $XOVI_DROPIN"
     say "installed $XOVI_DROPIN"
 fi
