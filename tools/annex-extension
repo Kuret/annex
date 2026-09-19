@@ -5,6 +5,10 @@
 #   annex-extension restore    put the extension back from Annex's own copy
 #   annex-extension vendor     refresh Annex's copy from the live one
 #   annex-extension install    install and persist the unit and the drop-in
+#   annex-extension persist <src> <dst>
+#                              copy one small file under the /etc overlay
+#   annex-extension unpersist <dst>
+#                              remove one, live and underneath
 #
 # ---------------------------------------------------------------------------
 # Why this exists
@@ -115,6 +119,40 @@ persist_enable() {
             warn "could not persist annex-extension.service"
         fi
     fi
+}
+
+# persist/unpersist expose the mechanism above to the installer.
+#
+# install.sh has to write xovi's own drop-in — the one that sets LD_PRELOAD, so
+# the one file without which the device comes back stock — under the same
+# overlay, before Annex's tools have any other reason to exist. It calls this
+# rather than carrying a second copy of bind_root in a heredoc, because two
+# copies of a technique this fiddly is how they drift apart and one of them
+# quietly stops working.
+
+cmd_persist() {
+    src="$1"
+    dst="$2"
+    [ -f "$src" ] || die "no such file: $src"
+    B=$(bind_root) || {
+        warn "cannot bind-mount /; $dst will not survive a reboot"
+        return 0
+    }
+    persist_file "$src" "$dst"
+    bind_root_close "$B"
+}
+
+cmd_unpersist() {
+    dst="$1"
+    rm -f "$dst" 2>/dev/null
+    B=$(bind_root) || {
+        warn "cannot bind-mount /; $dst may come back at the next reboot"
+        return 0
+    }
+    if [ -e "$B$dst" ]; then
+        rm -f "$B$dst" 2>/dev/null && say "removed $dst from under the overlay"
+    fi
+    bind_root_close "$B"
 }
 
 # ---------------------------------------------------------------------------
@@ -320,14 +358,16 @@ cmd_check() {
     echo "annex-extension: healthy"
 }
 
-[ $# -ge 1 ] || die "usage: annex-extension check|restore|vendor|install"
+[ $# -ge 1 ] || die "usage: annex-extension check|restore|vendor|install|persist|unpersist"
 action="$1"
 shift
 
 case "$action" in
-    check)   cmd_check ;;
-    restore) cmd_restore ;;
-    vendor)  cmd_vendor ;;
-    install) cmd_install ;;
-    *)       die "unknown action: $action" ;;
+    check)     cmd_check ;;
+    restore)   cmd_restore ;;
+    vendor)    cmd_vendor ;;
+    install)   cmd_install ;;
+    persist)   [ $# -ge 2 ] || die "persist needs <src> <dst>"; cmd_persist "$1" "$2" ;;
+    unpersist) [ $# -ge 1 ] || die "unpersist needs <dst>";     cmd_unpersist "$1" ;;
+    *)         die "unknown action: $action" ;;
 esac

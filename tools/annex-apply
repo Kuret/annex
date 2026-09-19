@@ -1,0 +1,56 @@
+#!/bin/sh
+# Make the files under /home/root/annex into an installed Annex.
+#
+#   annex-apply
+#
+# This is the device-side half of installing, and it is one script so that
+# there is **one definition of what "installed" means**. Both paths call it and
+# neither repeats it:
+#
+#   deploy.sh    the developer path — pushes a checkout and calls this
+#   install.sh   the user path — installs xovi, pushes the tree, calls this
+#
+# Everything here is idempotent, because both of those run it every time.
+#
+# It deliberately does not restart xochitl. The caller decides when the screen
+# is allowed to go away; deploy.sh prints the command and install.sh does it
+# once, at the end, after the last thing that could have failed.
+set -u
+
+ROOT="${ANNEX_ROOT:-/home/root/annex}"
+
+say() { echo "annex-apply: $*"; }
+die() { echo "annex-apply: $*" >&2; exit 1; }
+
+[ -d "$ROOT" ] || die "no $ROOT"
+
+# The tar that brought these across preserves modes, but a tree unpacked from a
+# zip, edited on a host that has no execute bit, or copied by hand has not.
+# An app's backend/run not being executable is the same failure as it being
+# absent, and reads as "the backend is not running" on the app's own screen.
+chmod +x "$ROOT"/tools/* 2>/dev/null
+find "$ROOT/apps" -name run -path '*/backend/*' -exec chmod +x {} + 2>/dev/null
+
+# The list of apps the host reads at startup.
+"$ROOT/tools/annex-index" || die "annex-index failed"
+
+# Backends are systemd services, so they start here and not when xochitl does.
+# This is also what reinstalls the unit template after an OS update, which
+# wipes /etc.
+"$ROOT/tools/annex-service" sync || die "annex-service sync failed"
+
+# Take a safety copy of the extension that applies annex.qmd, and install the
+# unit that puts it back.
+#
+# Annex depends on qt-resource-rebuilder and nothing on the device records
+# that, because Annex is not a package — so a package manager removing whatever
+# *does* own it takes Annex with it, silently. That happened on 2026-09-19;
+# tools/annex-extension has the log and the reasoning.
+#
+# The copy is made here, on the device, and stays here. It is a 9 MB
+# third-party GPL binary: it is not in the repository and Annex redistributes
+# none of it.
+"$ROOT/tools/annex-extension" vendor  || die "annex-extension vendor failed"
+"$ROOT/tools/annex-extension" install || die "annex-extension install failed"
+
+say "applied"

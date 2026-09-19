@@ -8,6 +8,13 @@
 #
 # Device-side requirements are busybox and an ssh server. Nothing is built —
 # apps are plain files, which is the point.
+#
+# **This is the developer path.** It assumes the device already has xovi,
+# qt-resource-rebuilder and an Annex install, and it only pushes the tree.
+# `install.sh` is the user path: it runs from a `curl | sh` one-liner with no
+# checkout, installs xovi and the drop-in from nothing, and holds one ssh
+# connection open so a device with no key asks for its password once. The two
+# share the device-side half (`tools/annex-apply`) and nothing else.
 set -euo pipefail
 
 HOST="${1:-${ANNEX_DEVICE:-10.11.99.1}}"
@@ -52,28 +59,12 @@ tar "${TAR_EXCLUDE[@]}" -cf - -C "$HERE" annex.qmd | "${SSH[@]}" "tar xf - -C $Q
 # A stale AppleDouble from an earlier deploy is still sitting there.
 "${SSH[@]}" "rm -f $QMD_DIR/._*.qmd $ROOT/._* $ROOT/*/._* $ROOT/apps/*/._* 2>/dev/null; true"
 
-"${SSH[@]}" "chmod +x $ROOT/tools/* && find $ROOT/apps -name run -path '*/backend/*' -exec chmod +x {} +"
-"${SSH[@]}" "$ROOT/tools/annex-index"
-
-# Backends are systemd services, so they start here and not when xochitl does.
-# This is also what reinstalls the unit template after an OS update, which
-# wipes /etc.
-"${SSH[@]}" "$ROOT/tools/annex-service sync"
-
-# Take a safety copy of the extension that applies annex.qmd, and install the
-# unit that puts it back.
-#
-# Annex depends on qt-resource-rebuilder and nothing on the device records
-# that, because Annex is not a vellum package — so a package manager removing
-# whatever *does* own it takes Annex with it, silently. That happened on
-# 2026-09-19. tools/annex-extension has the log and the reasoning.
-#
-# The copy is made on the device and stays there: it is a 9 MB third-party GPL
-# binary and it is not going in this repository. /home has tens of gigabytes
-# free; the rootfs, where the unit and drop-in go, has tens of megabytes, which
-# is why only those two tiny files are persisted under the /etc overlay.
-"${SSH[@]}" "$ROOT/tools/annex-extension vendor"
-"${SSH[@]}" "$ROOT/tools/annex-extension install"
+# Permissions, the app index, backend services, the extension safety copy and
+# the units — all of it is `annex-apply` on the device, so that "installed"
+# means one thing and is defined in one place. install.sh calls the same
+# script; see the note at the top of this file.
+"${SSH[@]}" "chmod +x $ROOT/tools/*"
+"${SSH[@]}" "$ROOT/tools/annex-apply"
 
 echo
 echo "deploy: installed. To load the UI:"
