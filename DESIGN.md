@@ -358,3 +358,75 @@ have forced.
 
 **Every app must emit `close` from something reachable on its first screen.**
 The README says so in the app contract, where a developer will meet it.
+
+---
+
+## 15. Annex repairs its own dependency, and does not pin it
+
+Annex needs `qt-resource-rebuilder`. It is not a package, so nothing on the
+device records that. Two measurements on 2026-09-19, both silent failures, both
+on real hardware.
+
+**Measurement: a package manager removed it.** Removing AppLoad through
+ReManager (a GUI over `vellum`, apk-based):
+
+```
+(1/3) Purging appload
+(2/3) Purging xovi-extensions
+(3/3) Purging qt-resource-rebuilder
+```
+
+AppLoad owned the extension; Annex's claim on it existed nowhere, so it was
+collected as an orphan. Annex left the sidebar with no error and no log line.
+`/etc/apk/world` is empty on this device, so nothing is protected from this.
+
+**Measurement: xochitl won the boot race.** `/home` is encrypted and mounts
+late; `xochitl.service` was ordered `After=data.mount` and not
+`After=home.mount`, and the LD_PRELOAD of `/home/root/xovi/xovi.so` failed:
+
+```
+ERROR: ld.so: object '/home/root/xovi/xovi.so' from LD_PRELOAD cannot be
+preloaded (cannot open shared object file): ignored.
+```
+
+One line, severity "ignored", boot successful, device stock. The existing
+`xovi-boot.service` reported `active (exited) status=0/SUCCESS` throughout,
+while doing nothing: it runs `xovi-autostart.sh`, which looks for a `start`
+script xovi 0.3.3 does not ship and exits 0. False confidence cost most of the
+evening.
+
+### The decision
+
+Annex **vendors a copy of the extension on the device** and restores it at
+boot, and adds an ordering-only drop-in to `xochitl.service`.
+
+Rejected: *writing `qt-resource-rebuilder` into `/etc/apk/world`*. That is the
+right fix and it is not ours — it is the package manager's state file, and a
+deploy script editing it behind vellum's back is two tools owning one file.
+`annex-extension check` reports that it is unpinned and lets a human decide.
+
+Rejected: *committing the `.so`*. 9 MB of third-party GPL binary in a tree
+whose entire premise is "apps are plain files, nothing is built". The copy is
+taken from the live device at deploy time; `/home` has tens of gigabytes free.
+
+Rejected: *`Requires=home.mount` on xochitl*. It would guarantee the ordering
+and it would also take the UI down with an unmountable `/home`. This device has
+already spent an evening unusable; a cold boot with a broken `/home` must still
+land on a working stock xochitl. Ordering costs nothing when the mount is fine
+and risks nothing when it is not.
+
+Rejected: *fixing `xovi-boot.service`*. Not our unit. `check` names it as a
+no-op instead, so nobody reads its green status as evidence again.
+
+Rejected: *checking at xochitl start, from QML*. By then it is too late — the
+extension is read when xochitl starts, so a check inside the injected QML only
+runs in the case where everything already worked.
+
+### Why both go under the overlay
+
+`/etc` is an overlay with a tmpfs upper layer (§7 records finding that the hard
+way with the backend template). A unit or drop-in copied into `/etc` is gone at
+the next reboot — the same reboot the boot-ordering drop-in exists to survive,
+which would have made it exactly as reliable as `xovi-boot.service`. Both are
+written under a bind mount of `/`, warning and carrying on if that is
+unavailable. Only these two tiny files; the rootfs is ~90% full.

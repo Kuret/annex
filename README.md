@@ -173,6 +173,84 @@ network interfaces are brought up by systemd. That is the escape hatch, and it
 is a script rather than a line in a README because the moment you need it is
 the moment the screen is not helping you.
 
+## What Annex depends on, and what removes it
+
+Annex is applied by xovi's `qt-resource-rebuilder` extension. That `.so` reads
+`annex.qmd` and patches xochitl's QML; without it, Annex is a directory of
+files nothing loads. Annex is not a package, so **nothing on the device records
+that dependency** — and both ways it breaks are silent.
+
+Ask, in one command:
+
+```sh
+ssh root@10.11.99.1 '/home/root/annex/tools/annex-extension check'
+```
+
+It reports the extension, the safety copy, `annex.qmd`, the boot-ordering
+drop-in, the self-heal unit, and whether `qt-resource-rebuilder` is pinned in
+`/etc/apk/world`. It exits non-zero when Annex is broken or will be after the
+next reboot.
+
+### A package manager can take the extension
+
+On 2026-09-19, removing AppLoad through ReManager (a GUI over `vellum`) did
+this:
+
+```
+(1/3) Purging appload
+(2/3) Purging xovi-extensions
+(3/3) Purging qt-resource-rebuilder
+```
+
+AppLoad owned the extension as a dependency. Annex needs it too, nothing said
+so, and it was collected as an orphan — after which Annex simply was not in the
+sidebar. No error, no log line, nothing to explain it. `/etc/apk/world`, the
+set of explicitly-wanted packages that survives orphan cleanup, is empty on
+this device, so anything else that owns the extension can do it again.
+
+So `deploy.sh` keeps a copy: `annex-extension vendor` copies the live
+`extensions.d/qt-resource-rebuilder.so` to `/home/root/annex/vendor/`, and
+`annex-extension.service` runs `annex-extension restore` at boot, ordered
+`Before=xochitl.service` because the extension is read when xochitl starts. If
+the extension is gone and the copy is there, it comes back and says so loudly
+in the journal.
+
+The copy is made **on the device and is not in this repository** — it is a 9 MB
+third-party GPL binary. Annex also does not edit `/etc/apk/world`; that is the
+package manager's state, and `check` reports it rather than fighting over it.
+
+### xochitl can start before `/home` is mounted
+
+`/home` is encrypted and mounts late. xochitl is started with
+`LD_PRELOAD=/home/root/xovi/xovi.so`, and the stock unit is ordered
+`After=data.mount` only, so on a cold boot xochitl can win the race:
+
+```
+ERROR: ld.so: object '/home/root/xovi/xovi.so' from LD_PRELOAD cannot be
+preloaded (cannot open shared object file): ignored.
+```
+
+"ignored" — the boot succeeds, xochitl runs, and the device is stock with no
+xovi and no Annex. `deploy.sh` installs a drop-in adding `After=home.mount` to
+`xochitl.service`. It is **ordering only**: if `/home` ever fails to mount, the
+tablet must still come up as stock xochitl rather than wedge with no screen to
+explain itself.
+
+Do not trust `xovi-boot.service` here. It runs `xovi-autostart.sh`, which looks
+for a `start` script xovi 0.3.3 does not ship, logs that it is missing and
+exits 0 — so it reports `active (exited) status=0/SUCCESS` while doing nothing.
+`annex-extension check` calls that out, because a unit that lies by succeeding
+is how this stayed undiagnosed.
+
+### Both survive a reboot
+
+The unit and the drop-in are written *underneath* the `/etc` overlay through a
+bind mount of `/`, the same mechanism `annex-service` uses for the backend
+template — `/etc` here has a tmpfs upper layer, so a plain `cp` into it is gone
+at the next boot, which is precisely the boot these two are meant to survive.
+Only the unit and the drop-in go on the rootfs (it is ~90% full); the 9 MB
+`.so` stays on `/home`.
+
 ## The shared library
 
 `lib/` holds what is useful to more than one app:
