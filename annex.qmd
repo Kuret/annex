@@ -87,23 +87,6 @@ AFFECT `/qml/device/view/navigator/Navigator.qml`
                 property var apps: []
                 property string currentId: ""
 
-                // ---- the escape hatch's one-consumed-in-a-row guard ---------
-                //
-                // escapeWindowMs bounds how long an app's "I handled that
-                // swipe" is honoured before the *next* swipe closes the host
-                // regardless of what the app says. 2000ms: long enough that a
-                // deliberate second swipe — thrown right after the first,
-                // because the first only left an inner view — still lands
-                // inside it, short enough that a genuine second escape minutes
-                // later is offered to the app fresh rather than treated as
-                // part of the same gesture. lastEscapeConsumedAt resets to 0
-                // (outside the window forever) whenever the host closes, an
-                // app is opened, or an app declines/throws — so only an
-                // unbroken pair of app-consumed escapes can trigger it, never
-                // a stale one from a previous app or session.
-                property real escapeWindowMs: 2000
-                property real lastEscapeConsumedAt: 0
-
                 function read(path, done) {
                     var xhr = new XMLHttpRequest();
                     xhr.onreadystatechange = function() {
@@ -195,9 +178,6 @@ AFFECT `/qml/device/view/navigator/Navigator.qml`
                     if (currentId === id && appLoader.item) { visible = true; return; }
                     closeCurrent();
                     currentId = id;
-                    // A fresh app gets a fresh chance at the next escape; it
-                    // never inherits whatever the previous app consumed.
-                    lastEscapeConsumedAt = 0;
                     console.log("[annex] opening " + id + " from " + a.dir);
                     appLoader.setSource("file://" + a.dir + "/" + a.entry);
                     visible = true;
@@ -210,57 +190,11 @@ AFFECT `/qml/device/view/navigator/Navigator.qml`
                     }
                     appLoader.setSource("");
                     currentId = "";
-                    lastEscapeConsumedAt = 0;
                 }
 
                 function close() {
                     visible = false;
                     closeCurrent();
-                }
-
-                // ---- the escape gesture --------------------------------------
-                //
-                // An app's root element may declare `function escapeRequested()
-                // -> bool`. Returning true means it handled the swipe itself
-                // (popped its own inner view) and the host stays open. Anything
-                // else — false, no such function, a throw, a non-boolean —
-                // closes the host exactly as if the app had not declared it at
-                // all.
-                //
-                // The guarantee this must not break: an app that always
-                // returns true must never be able to trap the user. So the
-                // host honours at most one consumed escape in a row — see
-                // escapeWindowMs above — and a second swipe within that window
-                // closes the host no matter what the app returns.
-                function escape() {
-                    var now = Date.now();
-                    if (lastEscapeConsumedAt && (now - lastEscapeConsumedAt) < escapeWindowMs) {
-                        // The app already consumed one; this is the very next
-                        // swipe, so it gets the user out unconditionally.
-                        lastEscapeConsumedAt = 0;
-                        console.log("[annex] escape swipe: second in a row, closing host");
-                        close();
-                        return;
-                    }
-
-                    var consumed = false;
-                    if (appLoader.item && typeof appLoader.item.escapeRequested === "function") {
-                        try {
-                            consumed = appLoader.item.escapeRequested() === true;
-                        } catch (e) {
-                            console.log("[annex] escapeRequested() threw: " + e);
-                            consumed = false;
-                        }
-                    }
-
-                    if (consumed) {
-                        lastEscapeConsumedAt = now;
-                        console.log("[annex] escape swipe: consumed by " + currentId);
-                    } else {
-                        lastEscapeConsumedAt = 0;
-                        console.log("[annex] escape swipe: closing host");
-                        close();
-                    }
                 }
 
                 Rectangle {
@@ -531,10 +465,8 @@ AFFECT `/qt/qml/xofm/modules/gestures/global/qml/GesturesWindow.qml`
                     var h = annexEscape.host();
                     console.log("[annex] escape swipe (GesturesWindow): host=" + h +
                                 " visible=" + (h ? h.visible : "n/a"));
-                    // h.escape() does the deciding — whether the app consumed
-                    // the swipe or the host closed — and logs which.
                     if (h && h.visible)
-                        h.escape();
+                        h.close();
                 }
             }
         }
