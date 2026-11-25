@@ -431,6 +431,17 @@ which would have made it exactly as reliable as `xovi-boot.service`. Both are
 written under a bind mount of `/`, warning and carrying on if that is
 unavailable. Only these two tiny files; the rootfs is ~90% full.
 
+That was not enough for the drop-in. Measured on OS 3.28.0.172 on 2026-11-25,
+19 days after a reboot, `check` reported `DROP-IN MISSING` with the file present
+underneath the overlay: xovi's `start` script, run by `xovi-boot.service` at
+every boot, mounts a tmpfs over `/etc/systemd/system/xochitl.service.d` and
+copies `/home/root/xovi/services/xochitl.service/` into it. xochitl's first
+start used the lower-layer drop-in and xovi's restart came after `/home` was
+up, so the device worked; the ordering was simply not in effect. The drop-in
+therefore lives in a third place, that directory, written only when it exists
+(a differently laid-out xovi gets no directory made for it), and `check` fails
+when it is missing, since the live drop-in is then gone after the next reboot.
+
 ---
 
 ## 16. The installer runs on the computer, not on the device

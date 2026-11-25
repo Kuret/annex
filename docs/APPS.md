@@ -597,7 +597,10 @@ preloaded (cannot open shared object file): ignored.
 ```
 
 Note "ignored": the boot succeeds and the device comes up stock. Annex installs
-an ordering-only drop-in (`After=home.mount`) against exactly this.
+an ordering-only drop-in (`After=home.mount`) against exactly this. It keeps a
+copy in `/home/root/xovi/services/xochitl.service/` as well, because xovi's
+start script mounts a tmpfs over `xochitl.service.d` at every boot and refills
+it only from there (measured on OS 3.28.0.172, 2026-11-25).
 
 ### Do not trust `xovi-boot.service`
 
