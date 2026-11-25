@@ -312,8 +312,12 @@ uninstall() {
     fi
 
     dev "systemctl disable --now annex-extension.service >/dev/null 2>&1; true"
+    # The third copy of the ordering drop-in is in xovi's service directory,
+    # which xovi's start script copies into /etc at every boot; left behind it
+    # would bring the drop-in back at the next one.
     dev "rm -f /etc/systemd/system/annex-extension.service \
                 /etc/systemd/system/xochitl.service.d/01-annex-wait-for-home.conf \
+                $XOVI/services/xochitl.service/01-annex-wait-for-home.conf \
                 /etc/systemd/system/annex-app@.service \
                 /etc/systemd/system/multi-user.target.wants/annex-extension.service"
     dev "systemctl daemon-reload || true"
