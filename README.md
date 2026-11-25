@@ -286,6 +286,15 @@ xovi and no Annex. Installing adds a drop-in with `After=home.mount` to
 tablet must still come up as stock xochitl rather than wedge with no screen to
 explain itself.
 
+xovi's own `start` script undoes this at every boot unless the drop-in is also
+in the directory it copies from: it mounts a fresh tmpfs over
+`/etc/systemd/system/xochitl.service.d` and copies
+`/home/root/xovi/services/xochitl.service/` into it, hiding every drop-in that
+is not in that directory. Measured on OS 3.28.0.172 on 2026-11-25, 19 days
+after a reboot: `annex-extension check` reported `DROP-IN MISSING` while the
+file sat underneath the overlay next to `00-xovi.conf`. So the drop-in also
+lives in `services/xochitl.service/`, where xovi copies it back at each start.
+
 Do not trust `xovi-boot.service` here. It runs `xovi-autostart.sh`, which looks
 for a `xovi/start` script the **vellum-packaged** xovi does not ship — its
 layout differs from the upstream release tarball — logs that it is missing and
@@ -302,6 +311,13 @@ template — `/etc` here has a tmpfs upper layer, so a plain `cp` into it is gon
 at the next boot, which is precisely the boot these two are meant to survive.
 Only the unit and the drop-in go on the rootfs (it is ~90% full); the 9 MB
 `.so` stays on `/home`.
+
+The drop-in has a third home, `/home/root/xovi/services/xochitl.service/`,
+because xovi's start script mounts a tmpfs over its directory in `/etc` at every
+boot and refills it from there. That one is on `/home`, so it needs no overlay
+trick. `annex-extension install` writes it only if the directory exists, and
+`annex-extension check` fails if it is missing: the live drop-in would be gone
+after the next reboot.
 
 ## The shared library
 

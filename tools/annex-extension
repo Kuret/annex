@@ -5,6 +5,7 @@
 #   annex-extension restore    put the extension back from Annex's own copy
 #   annex-extension vendor     refresh Annex's copy from the live one
 #   annex-extension install    install and persist the unit and the drop-in
+#                              (the drop-in in three places, see XOVI_SVC_DIR)
 #   annex-extension persist <src> <dst>
 #                              copy one small file under the /etc overlay
 #   annex-extension unpersist <dst>
@@ -52,10 +53,22 @@ VENDOR="$VENDOR_DIR/$EXT_NAME"
 QMD="$XOVI/exthome/qt-resource-rebuilder/annex.qmd"
 
 UNIT_SRC="$ROOT/systemd/annex-extension.service"
-UNIT_DST=/etc/systemd/system/annex-extension.service
+# Overridable only so the logic can be exercised against a fake tree; on the
+# device it is always /etc/systemd/system.
+SYSTEMD_DIR="${ANNEX_SYSTEMD_DIR:-/etc/systemd/system}"
+UNIT_DST="$SYSTEMD_DIR/annex-extension.service"
 DROPIN_SRC="$ROOT/systemd/xochitl-annex-ordering.conf"
-DROPIN_DIR=/etc/systemd/system/xochitl.service.d
+DROPIN_DIR="$SYSTEMD_DIR/xochitl.service.d"
 DROPIN_DST="$DROPIN_DIR/01-annex-wait-for-home.conf"
+# The third place the drop-in lives. xovi's `start` script (run at every boot by
+# xovi-boot.service, after home.mount and after xochitl's first start) mounts a
+# fresh tmpfs over $DROPIN_DIR and copies everything in this directory into it,
+# so a drop-in that is only in /etc, even underneath the overlay, is hidden for
+# the rest of the boot. Measured on OS 3.28.0.172, 2026-11-25: 19 days after a
+# reboot `check` said DROP-IN MISSING while the file sat in the lower layer next
+# to 00-xovi.conf. Only used when xovi has this directory; see cmd_install.
+XOVI_SVC_DIR="$XOVI/services/xochitl.service"
+DROPIN_XOVI="$XOVI_SVC_DIR/01-annex-wait-for-home.conf"
 
 say()  { echo "annex-extension: $*"; }
 warn() { echo "annex-extension: warning: $*" >&2; }
@@ -231,6 +244,21 @@ cmd_install() {
         say "installed $DROPIN_DST"
     fi
 
+    # And in xovi's service directory, so xovi's start script copies it into the
+    # tmpfs it mounts over $DROPIN_DIR at every boot. The directory is never
+    # created: a differently laid-out xovi (the vellum package has no start
+    # script and no services/) would get a directory nothing reads, and `check`
+    # would look healthier than the device is. /home survives reboots and
+    # rootfs updates, so no overlay trick is needed for this one.
+    if [ -d "$XOVI_SVC_DIR" ]; then
+        if ! cmp -s "$DROPIN_SRC" "$DROPIN_XOVI"; then
+            cp "$DROPIN_SRC" "$DROPIN_XOVI" || die "could not write $DROPIN_XOVI"
+            say "installed $DROPIN_XOVI"
+        fi
+    else
+        say "no $XOVI_SVC_DIR: xovi is laid out differently, not keeping a copy there"
+    fi
+
     systemctl daemon-reload || warn "daemon-reload failed"
     systemctl enable annex-extension.service >/dev/null 2>&1 \
         || warn "could not enable annex-extension.service"
@@ -303,14 +331,38 @@ cmd_check() {
     fi
 
     # The boot race. Ordering only lives in a drop-in on the tmpfs-backed /etc,
-    # so "it was there yesterday" is not evidence.
+    # so "it was there yesterday" is not evidence. Nor is the file underneath
+    # the overlay: xovi's start script mounts a tmpfs over the drop-in directory
+    # at every boot and hides it (see XOVI_SVC_DIR), so this looks at the live
+    # file, which is the one systemd reads.
     if [ -f "$DROPIN_DST" ]; then
         echo "boot order: xochitl waits for home.mount ($DROPIN_DST)"
+    elif [ -f "$DROPIN_XOVI" ] || mount | grep -qF " on $DROPIN_DIR type tmpfs"; then
+        echo "boot order: DROP-IN MISSING ($DROPIN_DST)"
+        echo "            xovi's start script mounts a tmpfs over $DROPIN_DIR"
+        echo "            at every boot and hides the drop-in stored under the /etc overlay."
+        echo "            xochitl is not ordered after home.mount. Run '$0 install'."
+        bad=1
     else
         echo "boot order: DROP-IN MISSING ($DROPIN_DST)"
         echo "            xochitl may start before /home is mounted, LD_PRELOAD of"
         echo "            xovi.so then fails with 'cannot be preloaded: ignored' and the"
         echo "            device comes up as stock xochitl. Re-run deploy.sh."
+        bad=1
+    fi
+
+    # The copy xovi's start script puts back at every boot. Without it the live
+    # drop-in above is right today and gone after the next reboot, which is
+    # inside this check's contract: exit 1 means broken now or after a boot.
+    if [ ! -d "$XOVI_SVC_DIR" ]; then
+        echo "xovi copy:  n/a ($XOVI_SVC_DIR does not exist; xovi is laid out differently)"
+    elif [ -f "$DROPIN_XOVI" ]; then
+        echo "xovi copy:  present ($DROPIN_XOVI)"
+    else
+        echo "xovi copy:  MISSING ($DROPIN_XOVI)"
+        echo "            xovi's start script rebuilds the drop-in directory from here at"
+        echo "            every boot, so after the next reboot xochitl will not wait for"
+        echo "            home.mount. Run '$0 install'."
         bad=1
     fi
 
