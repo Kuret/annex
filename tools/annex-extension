@@ -339,8 +339,8 @@ cmd_check() {
         echo "boot order: xochitl waits for home.mount ($DROPIN_DST)"
     elif [ -f "$DROPIN_XOVI" ] || mount | grep -qF " on $DROPIN_DIR type tmpfs"; then
         echo "boot order: DROP-IN MISSING ($DROPIN_DST)"
-        echo "            xovi's start script mounted a tmpfs over $DROPIN_DIR,"
-        echo "            which hides the drop-in persisted underneath the /etc overlay."
+        echo "            xovi's start script mounts a tmpfs over $DROPIN_DIR"
+        echo "            at every boot and hides the drop-in stored under the /etc overlay."
         echo "            xochitl is not ordered after home.mount. Run '$0 install'."
         bad=1
     else
