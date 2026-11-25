@@ -286,8 +286,9 @@ xovi and no Annex. Installing adds a drop-in with `After=home.mount` to
 tablet must still come up as stock xochitl rather than wedge with no screen to
 explain itself.
 
-xovi's own `start` script undoes this at every boot unless the drop-in is also in the directory it copies from: it
-mounts a fresh tmpfs over `/etc/systemd/system/xochitl.service.d` and copies
+xovi's own `start` script undoes this at every boot unless the drop-in is also
+in the directory it copies from: it mounts a fresh tmpfs over
+`/etc/systemd/system/xochitl.service.d` and copies
 `/home/root/xovi/services/xochitl.service/` into it, hiding every drop-in that
 is not in that directory. Measured on OS 3.28.0.172 on 2026-11-25, 19 days
 after a reboot: `annex-extension check` reported `DROP-IN MISSING` while the
