@@ -5,6 +5,7 @@
 #   annex-extension restore    put the extension back from Annex's own copy
 #   annex-extension vendor     refresh Annex's copy from the live one
 #   annex-extension install    install and persist the unit and the drop-in
+#                              (the drop-in in three places, see XOVI_SVC_DIR)
 #   annex-extension persist <src> <dst>
 #                              copy one small file under the /etc overlay
 #   annex-extension unpersist <dst>
@@ -52,10 +53,22 @@ VENDOR="$VENDOR_DIR/$EXT_NAME"
 QMD="$XOVI/exthome/qt-resource-rebuilder/annex.qmd"
 
 UNIT_SRC="$ROOT/systemd/annex-extension.service"
-UNIT_DST=/etc/systemd/system/annex-extension.service
+# Overridable only so the logic can be exercised against a fake tree; on the
+# device it is always /etc/systemd/system.
+SYSTEMD_DIR="${ANNEX_SYSTEMD_DIR:-/etc/systemd/system}"
+UNIT_DST="$SYSTEMD_DIR/annex-extension.service"
 DROPIN_SRC="$ROOT/systemd/xochitl-annex-ordering.conf"
-DROPIN_DIR=/etc/systemd/system/xochitl.service.d
+DROPIN_DIR="$SYSTEMD_DIR/xochitl.service.d"
 DROPIN_DST="$DROPIN_DIR/01-annex-wait-for-home.conf"
+# The third place the drop-in lives. xovi's `start` script (run at every boot by
+# xovi-boot.service, after home.mount and after xochitl's first start) mounts a
+# fresh tmpfs over $DROPIN_DIR and copies everything in this directory into it,
+# so a drop-in that is only in /etc, even underneath the overlay, is hidden for
+# the rest of the boot. Measured on OS 3.28.0.172, 2026-11-25: 19 days after a
+# reboot `check` said DROP-IN MISSING while the file sat in the lower layer next
+# to 00-xovi.conf. Only used when xovi has this directory; see cmd_install.
+XOVI_SVC_DIR="$XOVI/services/xochitl.service"
+DROPIN_XOVI="$XOVI_SVC_DIR/01-annex-wait-for-home.conf"
 
 say()  { echo "annex-extension: $*"; }
 warn() { echo "annex-extension: warning: $*" >&2; }
@@ -229,6 +242,21 @@ cmd_install() {
     if ! cmp -s "$DROPIN_SRC" "$DROPIN_DST"; then
         cp "$DROPIN_SRC" "$DROPIN_DST" || die "could not write $DROPIN_DST"
         say "installed $DROPIN_DST"
+    fi
+
+    # And in xovi's service directory, so xovi's start script copies it into the
+    # tmpfs it mounts over $DROPIN_DIR at every boot. The directory is never
+    # created: a differently laid-out xovi (the vellum package has no start
+    # script and no services/) would get a directory nothing reads, and `check`
+    # would look healthier than the device is. /home survives reboots and
+    # rootfs updates, so no overlay trick is needed for this one.
+    if [ -d "$XOVI_SVC_DIR" ]; then
+        if ! cmp -s "$DROPIN_SRC" "$DROPIN_XOVI"; then
+            cp "$DROPIN_SRC" "$DROPIN_XOVI" || die "could not write $DROPIN_XOVI"
+            say "installed $DROPIN_XOVI"
+        fi
+    else
+        say "no $XOVI_SVC_DIR: xovi is laid out differently, not keeping a copy there"
     fi
 
     systemctl daemon-reload || warn "daemon-reload failed"
