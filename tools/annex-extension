@@ -331,14 +331,38 @@ cmd_check() {
     fi
 
     # The boot race. Ordering only lives in a drop-in on the tmpfs-backed /etc,
-    # so "it was there yesterday" is not evidence.
+    # so "it was there yesterday" is not evidence. Nor is the file underneath
+    # the overlay: xovi's start script mounts a tmpfs over the drop-in directory
+    # at every boot and hides it (see XOVI_SVC_DIR), so this looks at the live
+    # file, which is the one systemd reads.
     if [ -f "$DROPIN_DST" ]; then
         echo "boot order: xochitl waits for home.mount ($DROPIN_DST)"
+    elif [ -f "$DROPIN_XOVI" ] || mount | grep -qF " on $DROPIN_DIR type tmpfs"; then
+        echo "boot order: DROP-IN MISSING ($DROPIN_DST)"
+        echo "            xovi's start script mounted a tmpfs over $DROPIN_DIR,"
+        echo "            which hides the drop-in persisted underneath the /etc overlay."
+        echo "            xochitl is not ordered after home.mount. Run '$0 install'."
+        bad=1
     else
         echo "boot order: DROP-IN MISSING ($DROPIN_DST)"
         echo "            xochitl may start before /home is mounted, LD_PRELOAD of"
         echo "            xovi.so then fails with 'cannot be preloaded: ignored' and the"
         echo "            device comes up as stock xochitl. Re-run deploy.sh."
+        bad=1
+    fi
+
+    # The copy xovi's start script puts back at every boot. Without it the live
+    # drop-in above is right today and gone after the next reboot, which is
+    # inside this check's contract: exit 1 means broken now or after a boot.
+    if [ ! -d "$XOVI_SVC_DIR" ]; then
+        echo "xovi copy:  n/a ($XOVI_SVC_DIR does not exist; xovi is laid out differently)"
+    elif [ -f "$DROPIN_XOVI" ]; then
+        echo "xovi copy:  present ($DROPIN_XOVI)"
+    else
+        echo "xovi copy:  MISSING ($DROPIN_XOVI)"
+        echo "            xovi's start script rebuilds the drop-in directory from here at"
+        echo "            every boot, so after the next reboot xochitl will not wait for"
+        echo "            home.mount. Run '$0 install'."
         bad=1
     fi
 
